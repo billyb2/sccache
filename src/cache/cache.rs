@@ -194,6 +194,14 @@ pub trait Storage: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// billdfaster metadata-touch diagnostics snapshot:
+    /// `(acknowledged touches, failed touches)`. Backends without the
+    /// integration report `(0, 0)`.
+    #[cfg(feature = "s3")]
+    fn billdfaster_touch_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// Wrapper for opendal::Operator that adds basedirs support
@@ -213,6 +221,10 @@ pub struct RemoteStorage {
     basedirs: Vec<Vec<u8>>,
     rw_mode: CacheMode,
     skip_cache_check: bool,
+    /// Optional billdfaster last-use metadata touch client. `None`
+    /// (the default) preserves exact upstream behavior.
+    #[cfg(feature = "s3")]
+    touch_client: Option<crate::cache::billdfaster_touch::TouchClient>,
 }
 
 #[cfg(any(
@@ -233,12 +245,41 @@ impl RemoteStorage {
             basedirs,
             rw_mode,
             skip_cache_check: false,
+            #[cfg(feature = "s3")]
+            touch_client: None,
         }
+    }
+
+    /// Opt this storage into the billdfaster last-use metadata touch
+    /// integration. Only called from the S3 cache construction site when
+    /// the opt-in environment variables are present.
+    #[cfg(feature = "s3")]
+    pub fn with_billdfaster_touch(
+        mut self,
+        touch_client: crate::cache::billdfaster_touch::TouchClient,
+    ) -> Self {
+        self.touch_client = Some(touch_client);
+        self
     }
 
     pub fn with_skip_cache_check(mut self, skip_cache_check: bool) -> Self {
         self.skip_cache_check = skip_cache_check;
         self
+    }
+
+    async fn read_with_touch(&self, key: &str) -> opendal::Result<opendal::Buffer> {
+        let key = normalize_key(key);
+        #[cfg(feature = "s3")]
+        if let Some(touch) = &self.touch_client {
+            return touch
+                .access(
+                    &key,
+                    crate::cache::billdfaster_touch::TouchOperation::Read,
+                    self.operator.read(&key),
+                )
+                .await;
+        }
+        self.operator.read(&key).await
     }
 }
 
@@ -261,7 +302,7 @@ impl Storage for RemoteStorage {
     }
 
     async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {
-        match self.operator.read(&normalize_key(key)).await {
+        match self.read_with_touch(key).await {
             Ok(res) => {
                 let data = res.to_bytes();
                 let hit = CacheRead::from(io::Cursor::new(data.clone()))?;
@@ -379,7 +420,7 @@ impl Storage for RemoteStorage {
     /// For backfill we need the raw bytes to write directly to another cache level.
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
         trace!("opendal::Operator::get_raw({})", key);
-        match self.operator.read(&normalize_key(key)).await {
+        match self.read_with_touch(key).await {
             Ok(res) => {
                 let data = res.to_bytes();
                 trace!(
@@ -414,9 +455,35 @@ impl Storage for RemoteStorage {
             bail!("storage is read-only");
         }
 
-        self.operator.write(&normalize_key(key), data).await?;
+        let key = normalize_key(key);
+        let write = self.operator.write(&key, data);
+        #[cfg(feature = "s3")]
+        match &self.touch_client {
+            Some(touch) => {
+                touch
+                    .access(
+                        &key,
+                        crate::cache::billdfaster_touch::TouchOperation::Write,
+                        write,
+                    )
+                    .await?;
+            }
+            None => {
+                write.await?;
+            }
+        }
+        #[cfg(not(feature = "s3"))]
+        write.await?;
 
         Ok(start.elapsed())
+    }
+
+    #[cfg(feature = "s3")]
+    fn billdfaster_touch_stats(&self) -> (u64, u64) {
+        match &self.touch_client {
+            Some(touch) => touch.stats_snapshot(),
+            None => (0, 0),
+        }
     }
 }
 
@@ -577,9 +644,9 @@ pub fn build_single_cache(
                 "Init s3 cache with bucket {}, endpoint {:?}",
                 c.bucket, c.endpoint
             );
-            let storage_builder =
+            let s3_cache_builder =
                 S3Cache::new(c.bucket.clone(), c.key_prefix.clone(), c.no_credentials);
-            let operator = storage_builder
+            let operator = s3_cache_builder
                 .with_region(c.region.clone())
                 .with_endpoint(c.endpoint.clone())
                 .with_use_ssl(c.use_ssl)
@@ -590,9 +657,32 @@ pub fn build_single_cache(
                 .build()
                 .map_err(|err| anyhow!("create s3 cache failed: {err:?}"))?;
 
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+            // billdfaster opt-in: when the touch endpoint/token are
+            // configured, S3 result-object accesses are tracked with
+            // last-use metadata. Otherwise upstream behavior is exactly
+            // preserved. The namespace is this cache's own configured
+            // key prefix (already trailing-slash-trimmed by upstream
+            // configuration parsing), never a separately guessed
+            // environment read.
+            let touch_endpoint = std::env::var("SCCACHE_BILLDFASTER_TOUCH_ENDPOINT").ok();
+            let touch_token = std::env::var("SCCACHE_BILLDFASTER_TOUCH_TOKEN").ok();
+            let storage_builder = match crate::cache::billdfaster_touch::TouchConfig::from_parts(
+                touch_endpoint,
+                touch_token,
+                c.key_prefix.clone(),
+            ) {
+                Some(touch_config) => {
+                    debug!("billdfaster metadata touch integration enabled");
+                    RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
+                        .with_skip_cache_check(skip_cache_check)
+                        .with_billdfaster_touch(crate::cache::billdfaster_touch::TouchClient::new(
+                            touch_config,
+                        ))
+                }
+                None => RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
+                    .with_skip_cache_check(skip_cache_check),
+            };
+            Ok(Arc::new(storage_builder))
         }
         #[cfg(feature = "webdav")]
         CacheType::Webdav(c) => {

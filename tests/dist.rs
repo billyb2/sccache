@@ -239,6 +239,10 @@ impl ServerIncoming for FailingServer {
             .context("Updating job state failed")?;
         bail!("internal build failure")
     }
+
+    fn handle_work_snapshot(&self) -> Result<sccache::dist::ServerWorkSnapshot> {
+        bail!("intentional worker recovery failure")
+    }
 }
 
 #[test]

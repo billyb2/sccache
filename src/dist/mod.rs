@@ -601,6 +601,56 @@ pub enum SubmitToolchainResult {
     CannotCache,
 }
 
+// Worker work snapshot (queried by the gateway during recovery)
+
+/// Version of the [`ServerWorkSnapshot`] schema.
+#[cfg(feature = "dist-server")]
+pub const SERVER_WORK_SNAPSHOT_VERSION: u64 = 1;
+
+/// Hard upper bound on jobs in a [`ServerWorkSnapshot`]. A snapshot with more
+/// entries fails explicitly rather than truncating.
+#[cfg(feature = "dist-server")]
+pub const MAX_WORK_SNAPSHOT_JOBS: usize = 4096;
+
+/// Lifecycle state of a job in a [`ServerWorkSnapshot`]. Completed jobs are
+/// never included, so there is no `Complete` variant.
+#[cfg(feature = "dist-server")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum WorkerJobSnapshotState {
+    Pending,
+    Ready,
+    Started,
+}
+
+#[cfg(feature = "dist-server")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerJobSnapshot {
+    pub job_id: JobId,
+    pub state: WorkerJobSnapshotState,
+    /// Monotonic idle age for unclaimed `Pending`/`Ready` jobs. Zero while a
+    /// request (toolchain upload or compile run) is active for the job, and
+    /// zero for `Started` jobs.
+    pub unclaimed_for_ms: u64,
+}
+
+/// Authoritative view of a worker's job state, served over an authenticated
+/// `GET /api/v1/distserver/work` and consumed by the gateway to reconstruct
+/// its job ledger after a restart. `next_job_id` is the highest successfully
+/// admitted assignment ID plus one for this worker incarnation, monotonic
+/// across job completion and expiry so recovered allocators never reuse an
+/// ID while the worker is alive.
+#[cfg(feature = "dist-server")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerWorkSnapshot {
+    pub version: u64,
+    pub server_nonce: ServerNonce,
+    pub next_job_id: u64,
+    pub jobs: Vec<WorkerJobSnapshot>,
+}
+
 ///////////////////
 
 // BuildResult
@@ -706,6 +756,8 @@ pub trait ServerIncoming: Send + Sync {
         outputs: Vec<String>,
         inputs_rdr: InputsReader<'_>,
     ) -> ExtResult<RunJobResult, Error>;
+    // From the gateway (recovery): authoritative worker job state
+    fn handle_work_snapshot(&self) -> ExtResult<ServerWorkSnapshot, Error>;
 }
 
 #[cfg(feature = "dist-server")]

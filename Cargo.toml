@@ -260,6 +260,9 @@ dist-server = [
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
 
+[patch.crates-io]
+reqwest = { git = "https://github.com/billyb2/reqwest.git", rev = "768c789781c179f1cb21eea650730ad8cb939722" }
+
 [workspace]
 exclude = ["tests/test-crate"]
 members = ["tests/integration/randomize_readdir"]

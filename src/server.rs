@@ -1140,7 +1140,18 @@ where
 
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
-        let stats = self.stats.lock().await.clone();
+        #[cfg_attr(not(feature = "s3"), expect(unused_mut))]
+        let mut stats = self.stats.lock().await.clone();
+        // Refresh billdfaster metadata-touch diagnostics from the live
+        // storage backend so the reported counters are current. The
+        // trait method carries a `(0, 0)` default for backends without
+        // the integration.
+        #[cfg(feature = "s3")]
+        {
+            let (ok, failed) = self.storage.billdfaster_touch_stats();
+            stats.billdfaster_touches_ok = ok;
+            stats.billdfaster_touches_failed = failed;
+        }
         ServerInfo::new(stats, Some(&*self.storage)).await
     }
 
@@ -1152,6 +1163,12 @@ where
     /// Snapshot and reset the current stats (used by client-side processes before exit).
     pub async fn take_stats(&self) -> ServerStats {
         let mut s = self.stats.lock().await;
+        #[cfg(feature = "s3")]
+        {
+            let (ok, failed) = self.storage.billdfaster_touch_stats();
+            s.billdfaster_touches_ok = ok;
+            s.billdfaster_touches_failed = failed;
+        }
         std::mem::take(&mut *s)
     }
 
@@ -1765,6 +1782,13 @@ pub struct ServerStats {
     pub dist_errors: u64,
     /// Multi-level cache statistics (if multi-level caching is enabled)
     pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
+    /// billdfaster metadata-touch diagnostics: acknowledged touches and
+    /// failed touches. Failed touches correspond to cache bypasses or
+    /// skipped writes; they never result in untracked S3 access.
+    #[serde(default)]
+    pub billdfaster_touches_ok: u64,
+    #[serde(default)]
+    pub billdfaster_touches_failed: u64,
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -1795,6 +1819,8 @@ impl std::ops::AddAssign for ServerStats {
             *self.dist_compiles.entry(k).or_default() += v;
         }
         self.dist_errors += rhs.dist_errors;
+        self.billdfaster_touches_ok += rhs.billdfaster_touches_ok;
+        self.billdfaster_touches_failed += rhs.billdfaster_touches_failed;
         self.multi_level = match (self.multi_level.take(), rhs.multi_level) {
             (Some(mut a), Some(b)) => {
                 a += b;
@@ -1854,6 +1880,8 @@ impl Default for ServerStats {
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             multi_level: None,
+            billdfaster_touches_ok: 0,
+            billdfaster_touches_failed: 0,
         }
     }
 }
@@ -1988,6 +2016,18 @@ impl ServerStats {
             stats_vec,
             self.dist_errors,
             "Failed distributed compilations"
+        );
+        // billdfaster metadata-touch diagnostics. Failed touches are
+        // cache bypasses/skipped writes, never untracked S3 access.
+        set_stat!(
+            stats_vec,
+            self.billdfaster_touches_ok,
+            "Billdfaster metadata touches"
+        );
+        set_stat!(
+            stats_vec,
+            self.billdfaster_touches_failed,
+            "Billdfaster metadata touch failures"
         );
 
         // Add multi-level cache statistics if available
@@ -2144,7 +2184,7 @@ impl ServerInfo {
             basedirs = Vec::new();
             multi_level = None;
         }
-        let version = env!("CARGO_PKG_VERSION").to_string();
+        let version = crate::VERSION.to_string();
         Ok(ServerInfo {
             stats: ServerStats {
                 multi_level,
@@ -2488,7 +2528,7 @@ mod tests {
 
         let output = writer.get_output();
 
-        assert!(output.contains("Cache hits rate                       -"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(4).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "-"));
     }
 
     #[test]
@@ -2518,10 +2558,10 @@ mod tests {
 
         let output = writer.get_output();
 
-        assert!(output.contains("Cache hits rate                    46.15 %"));
-        assert!(output.contains("Cache hits rate (C/C++)           100.00 %"));
-        assert!(output.contains("Cache hits rate (Cuda)              0.00 %"));
-        assert!(output.contains("Cache hits rate (Rust)             66.67 %"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(5).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "46.15" && w[4] == "%"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(C/C++)" && w[4] == "100.00" && w[5] == "%"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(Cuda)" && w[4] == "0.00" && w[5] == "%"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(Rust)" && w[4] == "66.67" && w[5] == "%"));
     }
 
     #[test]
@@ -2551,10 +2591,10 @@ mod tests {
 
         let output = writer.get_output();
 
-        assert!(output.contains("Cache hits rate                        -"));
-        assert!(output.contains("Cache hits rate (c/c++ [clang])   100.00 %"));
-        assert!(output.contains("Cache hits rate (cuda)              0.00 %"));
-        assert!(output.contains("Cache hits rate (rust)             33.33 %"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(4).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "-"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(7).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(c/c++" && w[4] == "[clang])" && w[5] == "100.00" && w[6] == "%"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(cuda)" && w[4] == "0.00" && w[5] == "%"));
+        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(rust)" && w[4] == "33.33" && w[5] == "%"));
     }
 
     // Test that 2 servers with the same hits will always be printed in the same order.

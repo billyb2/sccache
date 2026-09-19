@@ -108,7 +108,7 @@ fn get_clap_command() -> ClapCommand {
     };
 
     ClapCommand::new(env!("CARGO_PKG_NAME"))
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(concat!(env!("CARGO_PKG_VERSION"), "+billdfaster.dist.2"))
         .subcommand_required(true)
         .subcommand(
             ClapCommand::new("auth")

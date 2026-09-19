@@ -14,6 +14,8 @@
 
 #[cfg(feature = "azure")]
 pub mod azure;
+#[cfg(feature = "s3")]
+pub mod billdfaster_touch;
 #[allow(clippy::module_inception)]
 pub mod cache;
 pub mod cache_io;

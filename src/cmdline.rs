@@ -93,7 +93,7 @@ fn flag_infer_long(name: &'static str) -> Arg {
 /// Get the [`clap::Command`] used for argument parsing.
 fn get_clap_command() -> clap::Command {
     clap::Command::new(env!("CARGO_PKG_NAME"))
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(crate::VERSION)
         .max_term_width(110)
         .after_help(concat!(
             "Enabled features:\n",

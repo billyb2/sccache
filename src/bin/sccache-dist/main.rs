@@ -9,15 +9,16 @@ use sccache::config::{
 };
 use sccache::dist::{
     self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
-    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, RunJobResult,
-    SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId, ServerIncoming,
-    ServerNonce, ServerOutgoing, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
-    UpdateJobStateResult,
+    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, MAX_WORK_SNAPSHOT_JOBS,
+    RunJobResult, SERVER_WORK_SNAPSHOT_VERSION, SchedulerIncoming, SchedulerOutgoing,
+    SchedulerStatusResult, ServerId, ServerIncoming, ServerNonce, ServerOutgoing,
+    ServerWorkSnapshot, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
+    UpdateJobStateResult, WorkerJobSnapshot, WorkerJobSnapshotState,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map};
 use std::env;
 use std::io;
 use std::path::Path;
@@ -303,6 +304,7 @@ fn run(command: Command) -> Result<i32> {
                 bind_address,
                 scheduler_url.to_url(),
                 scheduler_auth,
+                server.server_nonce.clone(),
                 server,
             )
             .context("Failed to create sccache HTTP server instance")?;
@@ -709,7 +711,16 @@ impl SchedulerIncoming for Scheduler {
             };
 
             match (job_detail.state, job_state) {
-                (JobState::Pending, JobState::Ready) => entry.get_mut().state = job_state,
+                (JobState::Pending, JobState::Ready) => {
+                    entry.get_mut().state = job_state;
+                    // The ready grace period starts after the toolchain upload,
+                    // not when the job was allocated.
+                    if let Some(details) = server_details {
+                        if let Some(unclaimed) = details.jobs_unclaimed.get_mut(&job_id) {
+                            *unclaimed = now;
+                        }
+                    }
+                }
                 (JobState::Ready, JobState::Started) => {
                     if let Some(details) = server_details {
                         details.jobs_unclaimed.remove(&job_id);
@@ -749,11 +760,114 @@ impl SchedulerIncoming for Scheduler {
         })
     }
 }
+// Bounded job-state reporting to the scheduler. The total retry window is
+// aligned with the gateway recovery deadline; per-attempt HTTP timeouts are
+// applied on the request itself (see dist::http::ServerRequester).
+const JOB_STATE_REPORT_DEADLINE: Duration = SERVER_REMEMBER_ERROR_TIMEOUT;
+const JOB_STATE_REPORT_RETRY_SLEEP: Duration = Duration::from_secs(5);
+
+/// Locally authoritative record of a job's lifecycle on this worker.
+///
+/// The historical `job_toolchains` map forgot a job the moment it reached
+/// `Started`, so it could not describe running compiles during gateway
+/// recovery. This entry instead survives for the whole job: the toolchain is
+/// owned from assignment until completion, and `busy` marks a request body
+/// (toolchain upload) physically in flight so expiry and snapshots can
+/// distinguish a genuinely idle unclaimed job from one mid-request.
+#[derive(Clone, Debug)]
+enum WorkerJob {
+    Pending {
+        toolchain: Toolchain,
+        assigned_at: Instant,
+    },
+    Ready {
+        toolchain: Toolchain,
+        ready_at: Instant,
+    },
+    Started,
+    Complete,
+}
+
+struct WorkerJobEntry {
+    job: WorkerJob,
+    busy: bool,
+}
+
+#[derive(Default)]
+struct WorkerLedger {
+    jobs: BTreeMap<JobId, WorkerJobEntry>,
+    next_job_id: u64,
+    // Preserve out-of-order admission without retaining completed history
+    // forever. Requests older than the evicted replay window are stale.
+    retired: BTreeSet<JobId>,
+    retired_through: Option<JobId>,
+}
+
+impl WorkerLedger {
+    fn trim_retired(&mut self) {
+        while self.retired.len() > MAX_WORK_SNAPSHOT_JOBS {
+            let evicted = self.retired.pop_first().expect("nonempty replay window");
+            self.retired_through =
+                Some(self.retired_through.map_or(evicted, |old| old.max(evicted)));
+        }
+    }
+
+    fn retire(&mut self, id: JobId) {
+        self.jobs.remove(&id);
+        self.retired.insert(id);
+        self.trim_retired();
+    }
+
+    fn sweep_expired(&mut self, now: Instant) {
+        let retired = &mut self.retired;
+        self.jobs.retain(|id, entry| {
+            let expired = !entry.busy
+                && match &entry.job {
+                    WorkerJob::Pending { assigned_at, .. } => {
+                        now.saturating_duration_since(*assigned_at) > UNCLAIMED_PENDING_TIMEOUT
+                    }
+                    WorkerJob::Ready { ready_at, .. } => {
+                        now.saturating_duration_since(*ready_at) > UNCLAIMED_READY_TIMEOUT
+                    }
+                    WorkerJob::Started | WorkerJob::Complete => false,
+                };
+            if expired {
+                retired.insert(*id);
+            }
+            !expired
+        });
+        self.trim_retired();
+    }
+}
 
 pub struct Server {
     builder: Box<dyn BuilderIncoming>,
     cache: Mutex<TcCache>,
-    job_toolchains: Mutex<HashMap<JobId, Toolchain>>,
+    server_nonce: ServerNonce,
+    jobs: Mutex<WorkerLedger>,
+}
+
+struct UploadLease<'a> {
+    server: &'a Server,
+    job_id: JobId,
+}
+
+impl Drop for UploadLease<'_> {
+    fn drop(&mut self) {
+        let mut ledger = self.server.jobs.lock().unwrap();
+        if let Some(entry) = ledger.jobs.get_mut(&self.job_id) {
+            entry.busy = false;
+            if let WorkerJob::Ready { ready_at, .. } = &mut entry.job {
+                *ready_at = Instant::now();
+            }
+        }
+    }
+}
+
+fn unclaimed_ms(now: Instant, since: Instant) -> u64 {
+    now.checked_duration_since(since)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl Server {
@@ -767,7 +881,71 @@ impl Server {
         Ok(Server {
             builder,
             cache: Mutex::new(cache),
-            job_toolchains: Mutex::new(HashMap::new()),
+            server_nonce: ServerNonce::new(),
+            jobs: Mutex::new(WorkerLedger::default()),
+        })
+    }
+
+    fn report_job_state_with_retries(
+        requester: &dyn ServerOutgoing,
+        job_id: JobId,
+        state: JobState,
+    ) -> Result<()> {
+        let deadline = Instant::now() + JOB_STATE_REPORT_DEADLINE;
+        loop {
+            match requester.do_update_job_state(job_id, state) {
+                Ok(UpdateJobStateResult::Success) => return Ok(()),
+                Ok(UpdateJobStateResult::Fail { msg }) => bail!(
+                    "Scheduler rejected state report for job {}: {}",
+                    job_id,
+                    msg
+                ),
+                Err(error) => {
+                    // Every real HTTP attempt is capped at ten seconds.
+                    // Do not start another attempt beyond the total budget.
+                    if deadline.saturating_duration_since(Instant::now())
+                        <= JOB_STATE_REPORT_RETRY_SLEEP + Duration::from_secs(10)
+                    {
+                        return Err(error.context("Job state report retry deadline elapsed"));
+                    }
+                    warn!("Job {} state report failed; retrying", job_id);
+                    std::thread::sleep(JOB_STATE_REPORT_RETRY_SLEEP);
+                }
+            }
+        }
+    }
+
+    pub fn work_snapshot(&self) -> Result<ServerWorkSnapshot> {
+        let mut ledger = self.jobs.lock().unwrap();
+        let now = Instant::now();
+        ledger.sweep_expired(now);
+        if ledger.jobs.len() > MAX_WORK_SNAPSHOT_JOBS {
+            bail!("Worker work snapshot exceeds its job bound");
+        }
+        let mut jobs = Vec::with_capacity(ledger.jobs.len());
+        for (&job_id, entry) in &ledger.jobs {
+            let (state, age) = match &entry.job {
+                WorkerJob::Pending { assigned_at, .. } => (
+                    WorkerJobSnapshotState::Pending,
+                    unclaimed_ms(now, *assigned_at),
+                ),
+                WorkerJob::Ready { ready_at, .. } => {
+                    (WorkerJobSnapshotState::Ready, unclaimed_ms(now, *ready_at))
+                }
+                WorkerJob::Started => (WorkerJobSnapshotState::Started, 0),
+                WorkerJob::Complete => continue,
+            };
+            jobs.push(WorkerJobSnapshot {
+                job_id,
+                state,
+                unclaimed_for_ms: if entry.busy { 0 } else { age },
+            });
+        }
+        Ok(ServerWorkSnapshot {
+            version: SERVER_WORK_SNAPSHOT_VERSION,
+            server_nonce: self.server_nonce.clone(),
+            next_job_id: ledger.next_job_id,
+            jobs,
         })
     }
 }
@@ -775,51 +953,113 @@ impl Server {
 impl ServerIncoming for Server {
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
         let need_toolchain = !self.cache.lock().unwrap().contains_toolchain(&tc);
-        assert!(
-            self.job_toolchains
-                .lock()
-                .unwrap()
-                .insert(job_id, tc)
-                .is_none()
-        );
-        let state = if need_toolchain {
-            JobState::Pending
+        let mut ledger = self.jobs.lock().unwrap();
+        ledger.sweep_expired(Instant::now());
+        if ledger.jobs.contains_key(&job_id)
+            || ledger.retired.contains(&job_id)
+            || ledger.retired_through.is_some_and(|floor| job_id <= floor)
+        {
+            bail!("Duplicate or stale assignment for job {}", job_id);
+        }
+        if ledger.jobs.len() >= MAX_WORK_SNAPSHOT_JOBS {
+            bail!("Worker active-job bound exceeded");
+        }
+        let next = job_id.0.checked_add(1).context("Job ID exhausted")?;
+        let job = if need_toolchain {
+            WorkerJob::Pending {
+                toolchain: tc,
+                assigned_at: Instant::now(),
+            }
         } else {
-            // TODO: can start prepping the build environment now
-            JobState::Ready
+            WorkerJob::Ready {
+                toolchain: tc,
+                ready_at: Instant::now(),
+            }
         };
+        ledger
+            .jobs
+            .insert(job_id, WorkerJobEntry { job, busy: false });
+        ledger.next_job_id = ledger.next_job_id.max(next);
         Ok(AssignJobResult {
-            state,
+            state: if need_toolchain {
+                JobState::Pending
+            } else {
+                JobState::Ready
+            },
             need_toolchain,
         })
     }
+
     fn handle_submit_toolchain(
         &self,
         requester: &dyn ServerOutgoing,
         job_id: JobId,
         tc_rdr: ToolchainReader,
     ) -> Result<SubmitToolchainResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Ready)
-            .context("Updating job state failed")?;
-        // TODO: need to lock the toolchain until the container has started
-        // TODO: can start prepping container
-        let tc = match self.job_toolchains.lock().unwrap().get(&job_id).cloned() {
-            Some(tc) => tc,
-            None => return Ok(SubmitToolchainResult::JobNotFound),
+        let tc = {
+            let mut ledger = self.jobs.lock().unwrap();
+            ledger.sweep_expired(Instant::now());
+            let Some(entry) = ledger.jobs.get_mut(&job_id) else {
+                return Ok(SubmitToolchainResult::JobNotFound);
+            };
+            match &entry.job {
+                WorkerJob::Pending { toolchain, .. } | WorkerJob::Ready { toolchain, .. } => {
+                    if entry.busy {
+                        bail!("Concurrent duplicate upload for job {}", job_id);
+                    }
+                    entry.busy = true;
+                    toolchain.clone()
+                }
+                WorkerJob::Started | WorkerJob::Complete => {
+                    return Ok(SubmitToolchainResult::JobNotFound);
+                }
+            }
         };
-        let mut cache = self.cache.lock().unwrap();
-        // TODO: this returns before reading all the data, is that valid?
-        if cache.contains_toolchain(&tc) {
-            return Ok(SubmitToolchainResult::Success);
+        // Includes the state-report request, and clears on every error path.
+        let _upload = UploadLease {
+            server: self,
+            job_id,
+        };
+        let result = {
+            let mut cache = self.cache.lock().unwrap();
+            if cache.contains_toolchain(&tc) {
+                drop(cache);
+                io::copy(&mut { tc_rdr }, &mut io::sink())
+                    .context("Draining duplicate toolchain upload failed")?;
+                SubmitToolchainResult::Success
+            } else {
+                cache
+                    .insert_with(&tc, |mut file| {
+                        io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
+                    })
+                    .map(|_| SubmitToolchainResult::Success)
+                    .unwrap_or(SubmitToolchainResult::CannotCache)
+            }
+        };
+        let transitioned = if matches!(result, SubmitToolchainResult::Success) {
+            let mut ledger = self.jobs.lock().unwrap();
+            let entry = ledger
+                .jobs
+                .get_mut(&job_id)
+                .context("Active upload lost its job")?;
+            if matches!(entry.job, WorkerJob::Pending { .. }) {
+                entry.job = WorkerJob::Ready {
+                    toolchain: tc,
+                    ready_at: Instant::now(),
+                };
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if transitioned {
+            Self::report_job_state_with_retries(requester, job_id, JobState::Ready)?;
         }
-        Ok(cache
-            .insert_with(&tc, |mut file| {
-                io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
-            })
-            .map(|_| SubmitToolchainResult::Success)
-            .unwrap_or(SubmitToolchainResult::CannotCache))
+        Ok(result)
     }
+
     fn handle_run_job(
         &self,
         requester: &dyn ServerOutgoing,
@@ -828,28 +1068,209 @@ impl ServerIncoming for Server {
         outputs: Vec<String>,
         inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Started)
-            .context("Updating job state failed")?;
-        let tc = self.job_toolchains.lock().unwrap().remove(&job_id);
-        let res = match tc {
-            None => Ok(RunJobResult::JobNotFound),
-            Some(tc) => {
-                match self
-                    .builder
-                    .run_build(tc, command, outputs, inputs_rdr, &self.cache)
-                {
-                    Err(e) => Err(e.context("run build failed")),
-                    Ok(res) => Ok(RunJobResult::Complete(JobComplete {
-                        output: res.output,
-                        outputs: res.outputs,
-                    })),
-                }
+        let tc = {
+            let mut ledger = self.jobs.lock().unwrap();
+            ledger.sweep_expired(Instant::now());
+            let Some(entry) = ledger.jobs.get_mut(&job_id) else {
+                return Ok(RunJobResult::JobNotFound);
+            };
+            if matches!(entry.job, WorkerJob::Started | WorkerJob::Complete) {
+                bail!("Duplicate run for job {}", job_id);
+            }
+            if !matches!(entry.job, WorkerJob::Ready { .. }) {
+                return Ok(RunJobResult::JobNotFound);
+            }
+            match std::mem::replace(&mut entry.job, WorkerJob::Started) {
+                WorkerJob::Ready { toolchain, .. } => toolchain,
+                _ => unreachable!("Ready was checked under the same lock"),
             }
         };
-        requester
-            .do_update_job_state(job_id, JobState::Complete)
-            .context("Updating job state failed")?;
-        res
+        // Locally visible before reporting, but never hide an unsuccessful
+        // Started report or rerun the compiler to retry a state callback.
+        let result = Self::report_job_state_with_retries(requester, job_id, JobState::Started)
+            .and_then(|_| {
+                self.builder
+                    .run_build(tc, command, outputs, inputs_rdr, &self.cache)
+            })
+            .map(|result| {
+                RunJobResult::Complete(JobComplete {
+                    output: result.output,
+                    outputs: result.outputs,
+                })
+            });
+        {
+            let mut ledger = self.jobs.lock().unwrap();
+            let entry = ledger
+                .jobs
+                .get_mut(&job_id)
+                .context("Running job disappeared")?;
+            entry.job = WorkerJob::Complete;
+        }
+        let report = Self::report_job_state_with_retries(requester, job_id, JobState::Complete);
+        self.jobs.lock().unwrap().retire(job_id);
+        report?;
+        result
+    }
+
+    fn handle_work_snapshot(&self) -> Result<ServerWorkSnapshot> {
+        self.work_snapshot()
+    }
+}
+
+#[cfg(test)]
+mod worker_recovery_tests {
+    use super::*;
+
+    struct UnusedBuilder;
+    impl BuilderIncoming for UnusedBuilder {
+        fn run_build(
+            &self,
+            _: Toolchain,
+            _: CompileCommand,
+            _: Vec<String>,
+            _: InputsReader<'_>,
+            _: &Mutex<TcCache>,
+        ) -> Result<dist::BuildResult> {
+            unreachable!("snapshot tests never execute a compiler")
+        }
+    }
+
+    fn worker() -> (tempfile::TempDir, Server) {
+        let directory = tempfile::tempdir().unwrap();
+        let server = Server::new(Box::new(UnusedBuilder), directory.path(), 1024 * 1024).unwrap();
+        (directory, server)
+    }
+
+    fn toolchain() -> Toolchain {
+        Toolchain {
+            archive_id: "recovery-fixture".to_owned(),
+        }
+    }
+
+    #[test]
+    fn expiry_preserves_active_uploads_and_running_work() {
+        let (_directory, server) = worker();
+        for id in 0..4 {
+            server.handle_assign_job(JobId(id), toolchain()).unwrap();
+        }
+        let old = Instant::now() - Duration::from_secs(301);
+        {
+            let mut ledger = server.jobs.lock().unwrap();
+            for id in [0, 2] {
+                ledger.jobs.get_mut(&JobId(id)).unwrap().job = WorkerJob::Pending {
+                    toolchain: toolchain(),
+                    assigned_at: old,
+                };
+            }
+            ledger.jobs.get_mut(&JobId(1)).unwrap().job = WorkerJob::Ready {
+                toolchain: toolchain(),
+                ready_at: old,
+            };
+            ledger.jobs.get_mut(&JobId(2)).unwrap().busy = true;
+            ledger.jobs.get_mut(&JobId(3)).unwrap().job = WorkerJob::Started;
+        }
+        let snapshot = server.work_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .jobs
+                .iter()
+                .map(|job| job.job_id)
+                .collect::<Vec<_>>(),
+            vec![JobId(2), JobId(3)]
+        );
+        assert!(snapshot.jobs.iter().all(|job| job.unclaimed_for_ms == 0));
+        server
+            .jobs
+            .lock()
+            .unwrap()
+            .jobs
+            .get_mut(&JobId(2))
+            .unwrap()
+            .busy = false;
+        let snapshot = server.work_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .jobs
+                .iter()
+                .map(|job| job.job_id)
+                .collect::<Vec<_>>(),
+            vec![JobId(3)]
+        );
+        assert_eq!(snapshot.next_job_id, 4);
+        assert!(server.handle_assign_job(JobId(0), toolchain()).is_err());
+    }
+
+    #[test]
+    fn completed_work_cannot_reexecute_and_out_of_order_ids_remain_valid() {
+        let (_directory, server) = worker();
+        server.handle_assign_job(JobId(2), toolchain()).unwrap();
+        server.handle_assign_job(JobId(1), toolchain()).unwrap();
+        server
+            .jobs
+            .lock()
+            .unwrap()
+            .jobs
+            .get_mut(&JobId(2))
+            .unwrap()
+            .job = WorkerJob::Complete;
+        let snapshot = server.work_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .jobs
+                .iter()
+                .map(|job| job.job_id)
+                .collect::<Vec<_>>(),
+            vec![JobId(1)]
+        );
+        assert_eq!(snapshot.next_job_id, 3);
+        server.jobs.lock().unwrap().retire(JobId(2));
+        assert!(server.handle_assign_job(JobId(2), toolchain()).is_err());
+        assert!(server.handle_assign_job(JobId(1), toolchain()).is_err());
+        assert_eq!(server.work_snapshot().unwrap().next_job_id, 3);
+    }
+
+    #[test]
+    fn late_retirement_cannot_reopen_an_evicted_replay_window() {
+        let (_directory, server) = worker();
+        {
+            let mut ledger = server.jobs.lock().unwrap();
+            for id in 1..=(MAX_WORK_SNAPSHOT_JOBS as u64 + 5) {
+                ledger.retire(JobId(id));
+            }
+            // A very old compile can finish after newer tombstones expired.
+            ledger.retire(JobId(0));
+            assert!(ledger.retired.len() <= MAX_WORK_SNAPSHOT_JOBS);
+        }
+        assert!(server.handle_assign_job(JobId(1), toolchain()).is_err());
+        server
+            .handle_assign_job(JobId(MAX_WORK_SNAPSHOT_JOBS as u64 + 10), toolchain())
+            .unwrap();
+    }
+
+    #[test]
+    fn assignment_overflow_and_capacity_fail_without_partial_admission() {
+        let (_directory, server) = worker();
+        assert!(
+            server
+                .handle_assign_job(JobId(u64::MAX), toolchain())
+                .is_err()
+        );
+        assert_eq!(server.work_snapshot().unwrap().next_job_id, 0);
+        for id in 0..MAX_WORK_SNAPSHOT_JOBS as u64 {
+            server.handle_assign_job(JobId(id), toolchain()).unwrap();
+        }
+        assert!(
+            server
+                .handle_assign_job(JobId(MAX_WORK_SNAPSHOT_JOBS as u64), toolchain())
+                .is_err()
+        );
+        let snapshot = server.work_snapshot().unwrap();
+        assert_eq!(snapshot.jobs.len(), MAX_WORK_SNAPSHOT_JOBS);
+        assert_eq!(snapshot.next_job_id, MAX_WORK_SNAPSHOT_JOBS as u64);
+        assert_eq!(snapshot.jobs.first().unwrap().job_id, JobId(0));
+        assert_eq!(
+            snapshot.jobs.last().unwrap().job_id,
+            JobId(MAX_WORK_SNAPSHOT_JOBS as u64 - 1)
+        );
     }
 }

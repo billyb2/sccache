@@ -158,8 +158,9 @@ fn test_server_stats() {
     // Ask it for stats.
     let info = request_stats(conn).unwrap();
     assert_eq!(0, info.stats.compile_requests);
-    // Include sccache ver (cli) to validate.
-    assert_eq!(env!("CARGO_PKG_VERSION"), info.version);
+    // Include sccache ver (cli) to validate; the patched build reports
+    // the billdfaster version suffix.
+    assert_eq!(crate::VERSION, info.version);
     // Now signal it to shut down.
     sender.send(ServerMessage::Shutdown).ok().unwrap();
     // Ensure that it shuts down.

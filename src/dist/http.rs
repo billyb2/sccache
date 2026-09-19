@@ -261,7 +261,8 @@ mod server {
     use crate::dist::{
         self, AllocJobResult, AssignJobResult, HeartbeatServerResult, InputsReader, JobAuthorizer,
         JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
-        SubmitToolchainResult, Toolchain, ToolchainReader, UpdateJobStateResult,
+        ServerWorkSnapshot, SubmitToolchainResult, Toolchain, ToolchainReader,
+        UpdateJobStateResult,
     };
     use crate::errors::*;
 
@@ -892,6 +893,7 @@ mod server {
             bind_address: Option<SocketAddr>,
             scheduler_url: reqwest::Url,
             scheduler_auth: String,
+            server_nonce: ServerNonce,
             handler: S,
         ) -> Result<Self> {
             let (cert_digest, cert_pem, privkey_pem) =
@@ -899,7 +901,6 @@ mod server {
                     .context("failed to create HTTPS certificate for server")?;
             let mut jwt_key = vec![0; JWT_KEY_LENGTH];
             OsRng.fill_bytes(&mut jwt_key);
-            let server_nonce = ServerNonce::new();
 
             Ok(Self {
                 bind_address: bind_address.unwrap_or(public_addr),
@@ -934,12 +935,15 @@ mod server {
                 cert_pem: cert_pem.clone(),
             };
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
-            let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
             let requester = ServerRequester {
                 client: new_reqwest_blocking_client(),
                 scheduler_url,
+                // Cloned for the requester; the original stays with the
+                // request handler closure for work-snapshot authentication.
                 scheduler_auth: scheduler_auth.clone(),
             };
+            let heartbeat_scheduler_auth = scheduler_auth.clone();
+            let heartbeat_url = urls::scheduler_heartbeat_server(&requester.scheduler_url);
 
             // TODO: detect if this panics
             thread::spawn(move || {
@@ -949,7 +953,7 @@ mod server {
                     match bincode_req(
                         client
                             .post(heartbeat_url.clone())
-                            .bearer_auth(scheduler_auth.clone())
+                            .bearer_auth(heartbeat_scheduler_auth.clone())
                             .bincode(&heartbeat_req)
                             .expect("failed to serialize heartbeat"),
                     ) {
@@ -1012,6 +1016,29 @@ mod server {
                         let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(&requester, job_id, command, outputs, inputs_rdr));
                         prepare_response(request, &res)
                     },
+                    (GET) (/api/v1/distserver/work) => {
+                        // Recovery endpoint: the gateway queries the worker's
+                        // authoritative job state after a restart. Authenticate
+                        // with the same scheduler token the worker uses for
+                        // heartbeats (constant-time comparison), and bind the
+                        // snapshot to this incarnation's server nonce.
+                        let auth = match bearer_http_auth(request) {
+                            Some(auth) => auth,
+                            None => return make_401("no_bearer_auth"),
+                        };
+                        // scheduler_auth is "<server_id> <token>"; compare the
+                        // whole header value in constant time.
+                        if auth.len() != scheduler_auth.len()
+                            || !openssl::memcmp::eq(auth.as_bytes(), scheduler_auth.as_bytes())
+                        {
+                            warn!("Req {}: work snapshot request failed authentication", req_id);
+                            return make_401("invalid_bearer_token");
+                        }
+                        trace!("Req {}: work snapshot", req_id);
+
+                        let res: ServerWorkSnapshot = try_or_500_log!(req_id, handler.handle_work_snapshot());
+                        rouille::Response::json(&res)
+                    },
                     _ => {
                         warn!("Unknown request {:?}", request);
                         rouille::Response::empty_404()
@@ -1047,6 +1074,7 @@ mod server {
             bincode_req(
                 self.client
                     .post(url)
+                    .timeout(Duration::from_secs(10))
                     .bearer_auth(self.scheduler_auth.clone())
                     .bincode(&state)?,
             )

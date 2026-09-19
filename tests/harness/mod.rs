@@ -459,6 +459,7 @@ impl DistSystem {
             Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
             self.scheduler_url().to_url(),
             token,
+            dist::ServerNonce::new(),
             handler,
         )
         .unwrap();

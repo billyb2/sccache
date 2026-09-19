@@ -15,11 +15,11 @@
 use crate::compiler::args::*;
 use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand, clang,
+    clang, CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
+    SingleCompileCommand,
 };
 use crate::mock_command::{CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, run_input_output};
+use crate::util::{run_input_output, OsStrExt};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use fs::File;
@@ -590,10 +590,9 @@ where
             | Some(XClang(_))
             | Some(IntegratedAs)
             | Some(NoIntegratedAs)
-            | Some(TooHard(_)) => cannot_cache!(
-                arg.flag_str()
-                    .unwrap_or("Can't handle complex arguments through clang",)
-            ),
+            | Some(TooHard(_)) => cannot_cache!(arg
+                .flag_str()
+                .unwrap_or("Can't handle complex arguments through clang",)),
             None => match arg {
                 Argument::Raw(_) if follows_plugin_arg => &mut common_args,
                 Argument::Raw(flag) => cannot_cache!(
@@ -1073,7 +1072,29 @@ where
                 }
                 arguments.push("-fpreprocessed".into());
             }
-            arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
+            if kind == CCompilerKind::Clang
+                && !rewrite_includes_only
+                && !parsed_args.language.is_c_like_header()
+                && parsed_args.language.needs_c_preprocessing()
+            {
+                // billdfaster: macros have already been expanded locally.
+                // Clang rejects -U with -Werror on cpp-output input. Keep
+                // driver operands grouped so an option value is never stripped.
+                for arg in ArgsIter::new(
+                    parsed_args.common_args.iter().cloned(),
+                    (&ARGS[..], &super::clang::ARGS[..]),
+                ) {
+                    let arg = arg.ok()?;
+                    if matches!(arg.flag_str(), Some("-D" | "-U")) {
+                        continue;
+                    }
+                    for value in arg.iter_os_strings() {
+                        arguments.push(value.into_string().ok()?);
+                    }
+                }
+            } else {
+                arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
+            }
             Some(dist::CompileCommand {
                 executable: path_transformer.as_dist(executable)?,
                 arguments,
@@ -1870,9 +1891,8 @@ mod test {
 
     #[test]
     fn test_parse_arguments_explicit_dep_target() {
-        let args = stringvec![
-            "-c", "foo.c", "-MT", "depfile", "-fabc", "-MF", "foo.o.d", "-o", "foo.o"
-        ];
+        let args =
+            stringvec!["-c", "foo.c", "-MT", "depfile", "-fabc", "-MF", "foo.o.d", "-o", "foo.o"];
         let ParsedArguments {
             input,
             language,
@@ -2207,9 +2227,7 @@ mod test {
 
     #[test]
     fn test_parse_arguments_dep_target_needed() {
-        let args = stringvec![
-            "-c", "foo.c", "-fabc", "-MF", "foo.o.d", "-o", "foo.o", "-MD"
-        ];
+        let args = stringvec!["-c", "foo.c", "-fabc", "-MF", "foo.o.d", "-o", "foo.o", "-MD"];
         let ParsedArguments {
             input,
             language,
@@ -2463,9 +2481,7 @@ mod test {
 
         with_var("SCCACHE_CACHE_MULTIARCH", Some("1"), || {
             match parse_arguments_(
-                stringvec![
-                    "-arch", "arm64", "-arch", "arm64", "-o", "foo.o", "-c", "foo.cpp"
-                ],
+                stringvec!["-arch", "arm64", "-arch", "arm64", "-o", "foo.o", "-c", "foo.cpp"],
                 false,
             ) {
                 CompilerArguments::Ok(_) => {}
@@ -2633,6 +2649,94 @@ mod test {
             )
         );
         assert_eq!(ovec!["-DGREETING=hello world"], common_args);
+    }
+
+    #[test]
+    #[cfg(all(feature = "dist-client", unix))]
+    #[ignore = "requires a real Clang compiler; run by the Mac client build"]
+    fn test_dist_preprocessed_macro_flags() {
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        for rewrite_includes_only in [false, true] {
+            let source = cwd.join("macro.c");
+            fs::write(
+                &source,
+                "#if VALUE != 42\n#error macro ordering changed\n#endif\nint main(void) { return VALUE; }\n",
+            )
+            .unwrap();
+            let args = stringvec![
+                "-c",
+                "macro.c",
+                "-o",
+                "macro.o",
+                "-DVALUE=1",
+                "-U",
+                "VALUE",
+                "-DVALUE=42",
+                "-Werror"
+            ];
+            let parsed = match parse_arguments_clang(args.clone(), false) {
+                CompilerArguments::Ok(parsed) => parsed,
+                other => panic!("unexpected parse result: {other:?}"),
+            };
+            let mut preprocess = Command::new("clang");
+            preprocess.current_dir(&cwd).args([
+                "-E",
+                "-DVALUE=1",
+                "-U",
+                "VALUE",
+                "-DVALUE=42",
+                "-Werror",
+            ]);
+            if rewrite_includes_only {
+                preprocess.arg("-frewrite-includes");
+            }
+            let output = preprocess.arg(&source).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::write(&source, output.stdout).unwrap();
+            let (_, remote, _) = generate_compile_commands(
+                &mut dist::PathTransformer::new(),
+                Path::new("clang"),
+                &parsed,
+                &cwd,
+                &[],
+                CCompilerKind::Clang,
+                rewrite_includes_only,
+                language_to_gcc_arg,
+            )
+            .unwrap();
+            let remote = remote.unwrap();
+            let output = Command::new(&remote.executable)
+                .args(&remote.arguments)
+                .current_dir(&remote.cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = Command::new("clang")
+                .args(["macro.o", "-o", "consumer"])
+                .current_dir(&cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                Command::new(cwd.join("consumer")).status().unwrap().code(),
+                Some(42)
+            );
+        }
     }
 
     #[test]
