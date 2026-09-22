@@ -39,6 +39,10 @@ pub const BASE64_URL_SAFE_ENGINE: base64::engine::GeneralPurpose =
 
 pub const HASH_BUFFER_SIZE: usize = 128 * 1024;
 
+// Shared by every batch and runtime: Tokio's blocking pool can otherwise open
+// hundreds of files at once, exceeding inherited descriptor limits.
+static FILE_HASHING_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+
 #[derive(Clone)]
 pub struct Digest {
     inner: blake3_Hasher,
@@ -98,7 +102,11 @@ impl Digest {
     /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
     pub async fn reader(path: PathBuf, pool: &tokio::runtime::Handle) -> Result<String> {
+        let slot = FILE_HASHING_SLOTS.acquire().await?;
         pool.spawn_blocking(move || {
+            // A cancelled caller cannot release capacity while this job still
+            // owns an open file.
+            let _slot = slot;
             let mut digest = Digest::new();
             if path.is_dir() {
                 // For directories (e.g., from
@@ -406,9 +414,11 @@ pub async fn hash_all_archives(
 ) -> Result<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
-    let iter = files.iter().map(|path| {
+    let iter = files.iter().map(|path| async move {
+        let slot = FILE_HASHING_SLOTS.acquire().await?;
         let path = path.clone();
         pool.spawn_blocking(move || -> Result<String> {
+            let _slot = slot;
             let mut m = Digest::new();
             let archive_file = File::open(&path)
                 .with_context(|| format!("Failed to open file for hashing: {:?}", path))?;
@@ -430,19 +440,17 @@ pub async fn hash_all_archives(
 
             Ok(m.finish())
         })
+        .await?
     });
 
-    let mut hashes = futures::future::try_join_all(iter).await?;
-    if let Some(i) = hashes.iter().position(|res| res.is_err()) {
-        return Err(hashes.swap_remove(i).unwrap_err());
-    }
+    let hashes = futures::future::try_join_all(iter).await?;
 
     trace!(
         "Hashed {} files in {}",
         count,
         fmt_duration_as_secs(&start.elapsed())
     );
-    Ok(hashes.into_iter().map(|res| res.unwrap()).collect())
+    Ok(hashes)
 }
 
 fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
@@ -2181,34 +2189,70 @@ mod tests {
         assert_eq!(normalized, b"");
     }
 
-    #[tokio::test]
-    async fn test_digest_reader_hashes_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("hello.txt");
-        std::fs::write(&path, b"hello, world").unwrap();
-        let pool = tokio::runtime::Handle::current();
-        let hash = Digest::reader(path, &pool).await.unwrap();
-        assert_eq!(hash.len(), 64, "blake3 hex digest is 64 chars");
+    #[cfg(unix)]
+    #[test]
+    fn test_hashing_many_files_under_descriptor_limit() {
+        const CHILD: &str = "SCCACHE_TEST_HASH_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "util::tests::test_hashing_many_files_under_descriptor_limit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "low-descriptor child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        // Change the limit only in this subprocess, never in the test runner.
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        // Every hash opens its own descriptor, then waits for EOF. This exposes
+        // an excessive fan-out without a large fixture or expensive hashing.
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let reader = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            drop(writer);
+        });
+        let paths = vec![std::path::PathBuf::from(format!("/dev/fd/{}", reader.as_raw_fd())); 128];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = runtime.handle().clone();
+        let result = runtime.block_on(async {
+            // Concurrent batches must share the process-wide budget.
+            let batches = paths.chunks(32).map(|batch| super::hash_all(batch, &pool));
+            futures::future::try_join_all(batches).await
+        });
+        release.join().unwrap();
+        let empty_digest = Digest::reader_sync(std::io::empty()).unwrap();
+        assert_eq!(result.unwrap(), vec![vec![empty_digest; 32]; 4]);
     }
 
     // Regression for https://github.com/mozilla/sccache/issues/2653: rustc's
     // dep-info may list a directory path (e.g. from a proc macro that calls
-    // `proc_macro::tracked_path::path()` on a directory). The four tests below
+    // `proc_macro::tracked_path::path()` on a directory). The tests below
     // exercise Digest::reader against directories.
-
-    #[tokio::test]
-    async fn test_digest_reader_hashes_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path();
-        std::fs::create_dir_all(dir.join("nested/deeper")).unwrap();
-        std::fs::write(dir.join("root.txt"), b"root").unwrap();
-        std::fs::write(dir.join("nested/inner.txt"), b"inner").unwrap();
-        std::fs::write(dir.join("nested/deeper/deep.txt"), b"deep").unwrap();
-
-        let pool = tokio::runtime::Handle::current();
-        let hash = Digest::reader(dir.to_path_buf(), &pool).await.unwrap();
-        assert_eq!(hash.len(), 64);
-    }
 
     #[tokio::test]
     async fn test_digest_reader_directory_is_deterministic() {

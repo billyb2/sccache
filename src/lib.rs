@@ -57,7 +57,7 @@ use std::env;
 /// that sccache ie.
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "+billdfaster.4"
+    "+billdfaster.5"
 );
 
 /// Used to denote the environment variable that controls
