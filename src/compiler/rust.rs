@@ -203,6 +203,10 @@ pub struct RustCompilation {
     /// A shared, caching reader for rlib dependencies
     #[cfg(feature = "dist-client")]
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
+    /// The locally built rustc is not ABI-compatible with the acquired
+    /// release compiler, even when release and commit strings match.
+    #[cfg(feature = "dist-client")]
+    source_built_compiler: bool,
     /// All arguments passed to rustc
     arguments: Vec<Argument<ArgData>>,
     /// The compiler inputs.
@@ -1595,6 +1599,13 @@ where
         cwd.hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
+        // Old cache entries for source-built rustc may contain an official
+        // remote rustc's incompatible rlib. Segregate them before lookup,
+        // including on a cache hit where distributed admission never runs.
+        let source_built_compiler = self.version.contains("(built from a source tarball)");
+        if source_built_compiler {
+            "billdfaster/source-built-local-only/v1".hash(&mut HashToDigest { digest: &mut m });
+        }
 
         // Turn arguments into a simple Vec<OsString> to calculate outputs.
         let flat_os_string_arguments: Vec<OsString> = os_string_arguments
@@ -1737,6 +1748,8 @@ where
                 env_vars,
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
+                #[cfg(feature = "dist-client")]
+                source_built_compiler,
             }),
             weak_toolchain_key,
         })
@@ -1809,6 +1822,13 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         let dist_command = None;
         #[cfg(feature = "dist-client")]
         let dist_command = (|| {
+            if self.source_built_compiler {
+                debug!(
+                    "[{}]: source-built rustc cannot use an acquired release compiler",
+                    crate_name
+                );
+                return None;
+            }
             macro_rules! try_string_arg {
                 ($e:expr) => {
                     match $e {
@@ -1947,6 +1967,16 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
     }
 
+    #[cfg(feature = "dist-client")]
+    fn check_unsupported_inputs(&self) -> Result<()> {
+        can_distribute_inputs(
+            &self.crate_link_paths,
+            &self.inputs,
+            &self.rlib_dep_reader,
+            &self.env_vars,
+        )
+    }
+
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
         Box::new(self.outputs.iter().map(|(k, v)| FileObjectSource {
             key: k.clone(),
@@ -2003,6 +2033,139 @@ fn has_link_artifact_sibling(rlib: &Path) -> bool {
         dir.join(format!("{stem}.{ext}")).exists()
             || dir.join(format!("{unprefixed}.{ext}")).exists()
     })
+}
+
+/// Classify a link-path entry the way input packaging does: a crate library
+/// rustc could pick up, as `(crate_name, extension)`.
+///
+/// Mirrors the filename/extension matching in
+/// `RustInputsPackager::write_inputs` (including the extra-filename hash
+/// handling) so the two can never diverge.
+#[cfg(feature = "dist-client")]
+fn link_path_crate_lib(path: &Path) -> Option<(&str, &str)> {
+    let file_name = path.file_name()?.to_str()?;
+    let mut rev_name_split = file_name.rsplitn(2, '-');
+    let _extra_filename_and_ext = rev_name_split.next();
+    let libname = rev_name_split.next()?;
+    let ext = path.extension()?.to_str()?;
+    if libname.starts_with(DLL_PREFIX) && ext == DLL_EXTENSION {
+        Some((&libname[DLL_PREFIX.len()..], DLL_EXTENSION))
+    } else if libname.starts_with(RLIB_PREFIX) && ext == RLIB_EXTENSION {
+        Some((&libname[RLIB_PREFIX.len()..], RLIB_EXTENSION))
+    } else if libname.starts_with(RLIB_PREFIX) && ext == RMETA_EXTENSION {
+        Some((&libname[RLIB_PREFIX.len()..], RMETA_EXTENSION))
+    } else {
+        None
+    }
+}
+
+/// Find crate dylibs in the crate link paths that input packaging would try
+/// to send to a remote compile, i.e. the dylibs that cannot be packaged on
+/// this platform.
+///
+/// `dep_crate_names` mirrors `write_inputs`: `Some` restricts candidates to
+/// crates actually needed (dependency discovery was possible), `None` means
+/// every crate lib in the link paths would be packaged. Only path inspection
+/// happens here; read failures are skipped so that incidental I/O trouble is
+/// left for input packaging to surface as a real error instead of being
+/// misreported as platform ineligibility.
+#[cfg(feature = "dist-client")]
+fn find_unsupported_link_path_dylibs(
+    crate_link_paths: &[PathBuf],
+    dep_crate_names: Option<&HashSet<String>>,
+) -> Vec<PathBuf> {
+    let mut unsupported = vec![];
+    for crate_link_path in crate_link_paths {
+        let dir_entries = match fs::read_dir(crate_link_path) {
+            Ok(iter) => iter,
+            // A missing link path contributes nothing, same as in write_inputs
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            // Any other read failure is an incidental problem, not inherent
+            // ineligibility: leave it for input packaging to surface.
+            Err(_) => continue,
+        };
+        for entry in dir_entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(_) => continue,
+            };
+            let Some((crate_name, ext)) = link_path_crate_lib(&path) else {
+                continue;
+            };
+            if let Some(dep_crate_names) = dep_crate_names
+                && !dep_crate_names.contains(crate_name)
+            {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            if !super::CAN_DIST_DYLIBS && ext == DLL_EXTENSION {
+                unsupported.push(path);
+            }
+        }
+    }
+    unsupported
+}
+
+/// Check whether this compilation's inputs are inherently unsupported for
+/// distributed compilation on this platform (dylib inputs where
+/// `CAN_DIST_DYLIBS` is false).
+///
+/// Uses the same dependency discovery and packaging decisions as
+/// `RustInputsPackager::write_inputs`: direct dylib inputs and transitive
+/// needed dylibs from the crate link paths. Unrelated files in link paths
+/// never make a compilation ineligible. The only `Err` returned carries
+/// `UnsupportedInputsError`; every incidental failure is reported as
+/// eligible so the real error surfaces where it occurs (input packaging).
+#[cfg(feature = "dist-client")]
+fn can_distribute_inputs(
+    crate_link_paths: &[PathBuf],
+    inputs: &[PathBuf],
+    rlib_dep_reader: &Option<Arc<RlibDepReader>>,
+    env_vars: &[(OsString, OsString)],
+) -> Result<()> {
+    if super::CAN_DIST_DYLIBS {
+        return Ok(());
+    }
+
+    // Direct inputs: a dylib handed to rustc explicitly (source, extern or
+    // staticlib) can never be packaged on this platform.
+    if let Some(e) = super::unsupported_dist_inputs(inputs) {
+        return Err(e.into());
+    }
+
+    // Mirror write_inputs: without a dependency reader there is no way to
+    // tell which crates are needed, so everything found in the link paths
+    // would be packaged.
+    let is_cargo = env_vars.iter().any(|(k, _)| k == "CARGO_PKG_NAME");
+    let dep_crate_names = match (is_cargo, rlib_dep_reader) {
+        (true, Some(rlib_dep_reader)) => {
+            let mut dep_crate_names = HashSet::new();
+            for input_path in inputs {
+                if input_path
+                    .extension()
+                    .is_some_and(|ext| ext == RLIB_EXTENSION || ext == RMETA_EXTENSION)
+                {
+                    match rlib_dep_reader.discover_rlib_deps(env_vars, input_path) {
+                        Ok(names) => dep_crate_names.extend(names),
+                        // Dependency discovery trouble is an incidental
+                        // failure, not inherent ineligibility: leave it for
+                        // input packaging to surface.
+                        Err(_) => return Ok(()),
+                    }
+                }
+            }
+            Some(dep_crate_names)
+        }
+        _ => None,
+    };
+
+    let unsupported = find_unsupported_link_path_dylibs(crate_link_paths, dep_crate_names.as_ref());
+    if !unsupported.is_empty() {
+        return Err(super::UnsupportedInputsError(unsupported).into());
+    }
+    Ok(())
 }
 
 #[test]
@@ -2136,10 +2299,7 @@ impl pkg::InputsPackager for RustInputsPackager {
             let input_path = pkg::simplify_path(&input_path)?;
             if let Some(ext) = input_path.extension() {
                 if !super::CAN_DIST_DYLIBS && ext == DLL_EXTENSION {
-                    bail!(
-                        "Cannot distribute dylib input {} on this platform",
-                        input_path.display()
-                    )
+                    bail!(super::UnsupportedInputsError(vec![input_path.clone()]));
                 } else if (ext == RLIB_EXTENSION || ext == RMETA_EXTENSION)
                     && let Some((ref rlib_dep_reader, ref mut dep_crate_names)) =
                         rlib_dep_reader_and_names
@@ -2197,34 +2357,12 @@ impl pkg::InputsPackager for RustInputsPackager {
                 };
                 let path = entry.path();
 
+                // Take a look at the path and see if it's something we care about
+                let (crate_name, ext) = match link_path_crate_lib(&path) {
+                    Some((crate_name, ext)) => (crate_name, ext),
+                    None => continue,
+                };
                 {
-                    // Take a look at the path and see if it's something we care about
-                    let libname: &str = match path.file_name().and_then(|s| s.to_str()) {
-                        Some(name) => {
-                            let mut rev_name_split = name.rsplitn(2, '-');
-                            let _extra_filename_and_ext = rev_name_split.next();
-                            let libname = if let Some(libname) = rev_name_split.next() {
-                                libname
-                            } else {
-                                continue;
-                            };
-                            assert!(rev_name_split.next().is_none());
-                            libname
-                        }
-                        None => continue,
-                    };
-                    let (crate_name, ext): (&str, _) = match path.extension() {
-                        Some(ext) if libname.starts_with(DLL_PREFIX) && ext == DLL_EXTENSION => {
-                            (&libname[DLL_PREFIX.len()..], ext)
-                        }
-                        Some(ext) if libname.starts_with(RLIB_PREFIX) && ext == RLIB_EXTENSION => {
-                            (&libname[RLIB_PREFIX.len()..], ext)
-                        }
-                        Some(ext) if libname.starts_with(RLIB_PREFIX) && ext == RMETA_EXTENSION => {
-                            (&libname[RLIB_PREFIX.len()..], ext)
-                        }
-                        _ => continue,
-                    };
                     if let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names {
                         // We have a list of crate names we care about, see if this lib is a candidate
                         if !dep_crate_names.contains(crate_name) {
@@ -2234,10 +2372,7 @@ impl pkg::InputsPackager for RustInputsPackager {
                     if !path.is_file() {
                         continue;
                     } else if !super::CAN_DIST_DYLIBS && ext == DLL_EXTENSION {
-                        bail!(
-                            "Cannot distribute dylib input {} on this platform",
-                            path.display()
-                        )
+                        bail!(super::UnsupportedInputsError(vec![path.clone()]));
                     }
                 }
 
@@ -4138,5 +4273,495 @@ proc_macro false
         let args: Vec<OsString> = vec![OsString::from("@missing_file")];
         let result = parse_arguments(&args, cwd);
         assert!(matches!(result, CompilerArguments::CannotCache(..)));
+    }
+
+    /// Dist client that counts every interaction (scheduler or server call,
+    /// including toolchain uploads) and delegates to an inner client.
+    #[cfg(feature = "dist-client")]
+    mod dist_mock {
+        use async_trait::async_trait;
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use crate::dist::pkg::InputsPackager;
+        use crate::dist::{
+            self, AllocJobResult, CompileCommand, JobAlloc, JobComplete, JobId, OutputData,
+            PathTransformer, ProcessOutput, RunJobResult, SchedulerStatusResult, ServerId,
+            SubmitToolchainResult, Toolchain,
+        };
+        use crate::errors::*;
+
+        pub struct OneshotClient {
+            has_started: AtomicBool,
+            tc: Toolchain,
+            output: ProcessOutput,
+        }
+
+        impl OneshotClient {
+            #[allow(clippy::new_ret_no_self)]
+            pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
+                Arc::new(Self {
+                    has_started: AtomicBool::default(),
+                    tc: Toolchain {
+                        archive_id: "somearchiveid".to_owned(),
+                    },
+                    output: ProcessOutput::fake_output(code, stdout, stderr),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl dist::Client for OneshotClient {
+            async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+                assert!(
+                    !self
+                        .has_started
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                );
+                assert_eq!(self.tc, tc);
+                Ok(AllocJobResult::Success {
+                    job_alloc: JobAlloc {
+                        auth: "abcd".to_owned(),
+                        job_id: JobId(0),
+                        server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
+                    },
+                    need_toolchain: true,
+                })
+            }
+            async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
+                unreachable!()
+            }
+            async fn do_submit_toolchain(
+                &self,
+                job_alloc: JobAlloc,
+                tc: Toolchain,
+            ) -> Result<SubmitToolchainResult> {
+                assert_eq!(job_alloc.job_id, JobId(0));
+                assert_eq!(self.tc, tc);
+                Ok(SubmitToolchainResult::Success)
+            }
+            async fn do_run_job(
+                &self,
+                job_alloc: JobAlloc,
+                command: CompileCommand,
+                outputs: Vec<String>,
+                inputs_packager: Box<dyn InputsPackager>,
+            ) -> Result<(RunJobResult, PathTransformer)> {
+                assert_eq!(job_alloc.job_id, JobId(0));
+                assert_eq!(command.executable, "/overridden/compiler");
+                let mut inputs = vec![];
+                let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
+                let outputs = outputs
+                    .into_iter()
+                    .map(|name| {
+                        let data = format!("some data in {}", name);
+                        let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
+                        (name, data)
+                    })
+                    .collect();
+                let result = RunJobResult::Complete(JobComplete {
+                    output: self.output.clone(),
+                    outputs,
+                });
+                Ok((result, path_transformer))
+            }
+            async fn put_toolchain(
+                &self,
+                _: PathBuf,
+                _: String,
+                _: Box<dyn crate::dist::pkg::ToolchainPackager>,
+            ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+                Ok((
+                    self.tc.clone(),
+                    Some((
+                        "/overridden/compiler".to_owned(),
+                        PathBuf::from("somearchiveid"),
+                    )),
+                ))
+            }
+            fn rewrite_includes_only(&self) -> bool {
+                false
+            }
+            fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
+                None
+            }
+        }
+
+        /// Wraps a client and counts every dist interaction, including
+        /// toolchain uploads and job allocation.
+        pub struct CountingClient {
+            inner: Arc<dyn dist::Client>,
+            interactions: AtomicUsize,
+        }
+
+        impl CountingClient {
+            #[allow(clippy::new_ret_no_self)]
+            pub fn new(inner: Arc<dyn dist::Client>) -> Arc<Self> {
+                Arc::new(Self {
+                    inner,
+                    interactions: AtomicUsize::new(0),
+                })
+            }
+
+            pub fn interactions(&self) -> usize {
+                self.interactions.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait]
+        impl dist::Client for CountingClient {
+            async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+                self.interactions.fetch_add(1, Ordering::SeqCst);
+                self.inner.do_alloc_job(tc).await
+            }
+            async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
+                self.interactions.fetch_add(1, Ordering::SeqCst);
+                self.inner.do_get_status().await
+            }
+            async fn do_submit_toolchain(
+                &self,
+                job_alloc: JobAlloc,
+                tc: Toolchain,
+            ) -> Result<SubmitToolchainResult> {
+                self.interactions.fetch_add(1, Ordering::SeqCst);
+                self.inner.do_submit_toolchain(job_alloc, tc).await
+            }
+            async fn do_run_job(
+                &self,
+                job_alloc: JobAlloc,
+                command: CompileCommand,
+                outputs: Vec<String>,
+                inputs_packager: Box<dyn InputsPackager>,
+            ) -> Result<(RunJobResult, PathTransformer)> {
+                self.interactions.fetch_add(1, Ordering::SeqCst);
+                self.inner
+                    .do_run_job(job_alloc, command, outputs, inputs_packager)
+                    .await
+            }
+            async fn put_toolchain(
+                &self,
+                compiler_path: PathBuf,
+                weak_key: String,
+                toolchain_packager: Box<dyn crate::dist::pkg::ToolchainPackager>,
+            ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+                self.interactions.fetch_add(1, Ordering::SeqCst);
+                self.inner
+                    .put_toolchain(compiler_path, weak_key, toolchain_packager)
+                    .await
+            }
+            fn rewrite_includes_only(&self) -> bool {
+                self.inner.rewrite_includes_only()
+            }
+            fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {
+                self.inner.get_custom_toolchain(exe)
+            }
+        }
+    }
+
+    /// Regression test: a Rust compilation whose inputs are inherently
+    /// unsupported for distribution on this platform (a directly-passed
+    /// native proc-macro dylib, plus a needed transitive dylib in a crate
+    /// link path) must compile locally through the regular NoDist path and
+    /// still be cached, without a single dist interaction (no toolchain
+    /// upload, no job allocation, no failed-dist counting).
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_dist_rust_unsupported_inputs_compile_locally_and_cache() {
+        use crate::cache::Cache;
+        use crate::server;
+
+        if super::super::CAN_DIST_DYLIBS {
+            // On platforms that can distribute dylibs the precheck is a
+            // no-op and this scenario cannot occur.
+            return;
+        }
+
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+        let storage = Arc::new(MockStorage::new(None, false));
+        let counting = dist_mock::CountingClient::new(dist_mock::OneshotClient::new(
+            0,
+            b"compiler stdout".to_vec(),
+            b"compiler stderr".to_vec(),
+        ));
+        let dist_client: Arc<dyn crate::dist::Client> = counting.clone();
+        let service = server::SccacheService::mock_with_dist_client(
+            dist_client.clone(),
+            storage.clone(),
+            pool.clone(),
+        );
+
+        let cwd = f.tempdir.path();
+        f.touch("foo.rs").unwrap();
+        let direct_name = format!("{DLL_PREFIX}directproc.{DLL_EXTENSION}");
+        f.touch(&direct_name).unwrap();
+        // Crate link path with a transitive dylib. Without a dependency
+        // reader (and without CARGO_PKG_NAME) input packaging would send
+        // every crate lib in the link path, so both are part of the
+        // unsupported input set; neither may trigger a dist interaction.
+        let deps_dir = cwd.join("deps");
+        std::fs::create_dir_all(&deps_dir).unwrap();
+        std::fs::write(
+            deps_dir.join(format!("{DLL_PREFIX}transitiveproc-abc123.{DLL_EXTENSION}")),
+            b"dylib",
+        )
+        .unwrap();
+        std::fs::write(
+            deps_dir.join(format!("{DLL_PREFIX}unrelated-xyz789.{DLL_EXTENSION}")),
+            b"dylib",
+        )
+        .unwrap();
+        // Output the local compile will produce and the cache will store.
+        std::fs::create_dir_all(cwd.join("out")).unwrap();
+        std::fs::write(cwd.join("out").join("foo.rlib"), b"object").unwrap();
+
+        let direct_extern = format!("directmac={direct_name}");
+        let arguments = ovec![
+            "--emit",
+            "link",
+            "foo.rs",
+            "--extern",
+            direct_extern.as_str(),
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-L",
+            deps_dir.to_str().unwrap()
+        ];
+        let parsed_args = match parse_arguments(&arguments, cwd) {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        let mut hasher = Box::new(RustHasher {
+            executable: "rustc".into(),
+            host: "x86-64-unknown-unknown-unknown".to_owned(),
+            version: TEST_RUSTC_VERSION.to_string(),
+            sysroot: cwd.join("sysroot"),
+            compiler_shlibs_digests: vec![],
+            rlib_dep_reader: None,
+            parsed_args,
+        });
+
+        // Hashing: dep-info then file-names, as in other tests.
+        mock_dep_info(&creator, &["foo.rs"]);
+        mock_file_names(&creator, &["foo.rlib"]);
+        // The local compiler invocation.
+        next_command(
+            &creator,
+            Ok(MockChild::new(
+                exit_status(0),
+                "compiler stdout",
+                "compiler stderr",
+            )),
+        );
+        // Cache lookup: a miss, so the compile runs and the result is stored.
+        storage.next_get(Ok(Cache::Miss));
+
+        let (cached, res) = runtime
+            .block_on(async {
+                hasher
+                    .get_cached_or_compile(
+                        &service,
+                        Some(dist_client.clone()),
+                        creator.clone(),
+                        storage.clone(),
+                        arguments.clone(),
+                        cwd.to_path_buf(),
+                        vec![],
+                        CacheControl::Default,
+                        pool.clone(),
+                    )
+                    .await
+            })
+            .unwrap();
+
+        // Nothing may have been sent to the dist infrastructure: no
+        // toolchain upload, no job allocation, no job run.
+        assert_eq!(counting.interactions(), 0);
+        match cached {
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
+                // wait on cache write future so we don't race with it!
+                f.wait().unwrap();
+            }
+            other => panic!("Unexpected compile result: {:?}", other),
+        }
+        assert_eq!(exit_status(0), res.status);
+        assert_eq!(b"compiler stdout".as_slice(), res.stdout.as_slice());
+        assert_eq!(b"compiler stderr".as_slice(), res.stderr.as_slice());
+    }
+
+    /// Control case for the regression above: a plain Rust compilation with
+    /// no dylib inputs still goes through the distributed path.
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_dist_rust_plain_inputs_still_distributed() {
+        use crate::cache::Cache;
+        use crate::server;
+
+        if super::super::CAN_DIST_DYLIBS {
+            return;
+        }
+
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+        let storage = Arc::new(MockStorage::new(None, false));
+        let dist_client = dist_mock::OneshotClient::new(
+            0,
+            b"compiler stdout".to_vec(),
+            b"compiler stderr".to_vec(),
+        );
+        let service = server::SccacheService::mock_with_dist_client(
+            dist_client.clone(),
+            storage.clone(),
+            pool.clone(),
+        );
+
+        let cwd = f.tempdir.path();
+        f.touch("foo.rs").unwrap();
+        std::fs::create_dir_all(cwd.join("out")).unwrap();
+
+        let arguments = ovec![
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib"
+        ];
+        let parsed_args = match parse_arguments(&arguments, cwd) {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        let mut hasher = Box::new(RustHasher {
+            executable: "rustc".into(),
+            host: "x86-64-unknown-unknown-unknown".to_owned(),
+            version: TEST_RUSTC_VERSION.to_string(),
+            sysroot: cwd.join("sysroot"),
+            compiler_shlibs_digests: vec![],
+            rlib_dep_reader: None,
+            parsed_args,
+        });
+
+        mock_dep_info(&creator, &["foo.rs"]);
+        mock_file_names(&creator, &["foo.rlib"]);
+        storage.next_get(Ok(Cache::Miss));
+
+        let (cached, res) = runtime
+            .block_on(async {
+                hasher
+                    .get_cached_or_compile(
+                        &service,
+                        Some(dist_client.clone()),
+                        creator.clone(),
+                        storage.clone(),
+                        arguments.clone(),
+                        cwd.to_path_buf(),
+                        vec![],
+                        CacheControl::Default,
+                        pool.clone(),
+                    )
+                    .await
+            })
+            .unwrap();
+
+        match cached {
+            CompileResult::CacheMiss(MissType::Normal, DistType::Ok(_), _, f) => {
+                // wait on cache write future so we don't race with it!
+                f.wait().unwrap();
+            }
+            other => panic!("Unexpected compile result: {:?}", other),
+        }
+        assert_eq!(exit_status(0), res.status);
+    }
+
+    /// Regression test: the input eligibility scan must only report dylibs
+    /// of crates that would actually be packaged - an unrelated dylib in a
+    /// crate link path must never make a compilation ineligible.
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_find_unsupported_link_path_dylibs_ignores_unneeded() {
+        if super::super::CAN_DIST_DYLIBS {
+            return;
+        }
+        let f = TestFixture::new();
+        let deps_dir = f.tempdir.path().join("deps");
+        std::fs::create_dir_all(&deps_dir).unwrap();
+        let needed_dylib = deps_dir.join(format!("{DLL_PREFIX}neededproc-abc123.{DLL_EXTENSION}"));
+        std::fs::write(&needed_dylib, b"").unwrap();
+        std::fs::write(
+            deps_dir.join(format!("{DLL_PREFIX}unrelated-xyz789.{DLL_EXTENSION}")),
+            b"",
+        )
+        .unwrap();
+
+        let mut needed = HashSet::new();
+        needed.insert("neededproc".to_string());
+        let unsupported =
+            super::find_unsupported_link_path_dylibs(&[deps_dir.clone()], Some(&needed));
+        assert_eq!(unsupported, vec![needed_dylib]);
+
+        // Nothing needed from this link path: nothing reported, even though
+        // dylibs are present.
+        let mut other = HashSet::new();
+        other.insert("somethingelse".to_string());
+        let unsupported = super::find_unsupported_link_path_dylibs(&[deps_dir], Some(&other));
+        assert!(unsupported.is_empty());
+    }
+
+    /// The link-path classifier must agree with input packaging on what
+    /// constitutes a crate library, including extra-filename hashes (a
+    /// crate lib without the `-hash` suffix is not picked up, exactly as
+    /// in `write_inputs`).
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_link_path_crate_lib() {
+        use super::link_path_crate_lib;
+
+        let dll = format!("/x/deps/{DLL_PREFIX}foo-abc123.{DLL_EXTENSION}");
+        assert_eq!(
+            link_path_crate_lib(Path::new(&dll)),
+            Some(("foo", DLL_EXTENSION))
+        );
+        assert_eq!(
+            link_path_crate_lib(Path::new("/x/deps/libfoo-abc123.rlib")),
+            Some(("foo", "rlib"))
+        );
+        assert_eq!(
+            link_path_crate_lib(Path::new("/x/deps/libfoo-abc123.rmeta")),
+            Some(("foo", "rmeta"))
+        );
+        // No `-extra-filename` suffix: not treated as a crate lib.
+        assert_eq!(
+            link_path_crate_lib(Path::new(&format!(
+                "/x/deps/{DLL_PREFIX}foo.{DLL_EXTENSION}"
+            ))),
+            None
+        );
+        // A missing library prefix is not a crate library on platforms that
+        // have one. Windows has an empty DLL_PREFIX.
+        if !DLL_PREFIX.is_empty() {
+            assert_eq!(
+                link_path_crate_lib(Path::new(&format!("/x/deps/foo-abc123.{DLL_EXTENSION}"))),
+                None
+            );
+        }
+        assert_eq!(link_path_crate_lib(Path::new("/x/deps/libfoo.a")), None);
+        assert_eq!(
+            link_path_crate_lib(Path::new("/x/deps/libfoo-abc.txt")),
+            None
+        );
     }
 }

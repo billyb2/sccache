@@ -35,11 +35,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::errors::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-/// Patch revision of the billdfaster metadata-touch integration.
-/// Bumped whenever this patch changes. Surfaced in `sccache --version`
-/// and in `ServerInfo::version` as `+billdfaster.<rev>`.
-pub const BF_PATCH_REVISION: &str = "3";
-
 /// Total deadline for one metadata touch exchange, including Flycast cold
 /// start, bounded retries and acknowledgement.
 pub const TOUCH_DEADLINE: Duration = Duration::from_secs(300);
@@ -212,25 +207,42 @@ impl TouchClient {
     /// return the server-issued expiry. Bounded retries with a total
     /// deadline of [`TOUCH_DEADLINE`] enforced against absolute wall
     /// time (not reset per attempt); the final attempt is not retried
-    /// once the deadline has fully elapsed.
+    /// once the deadline has fully elapsed. A real Tokio timer bounds
+    /// each attempt so a pending request future (a silent endpoint that
+    /// never answers) still terminates at the total deadline even
+    /// though nothing external wakes it.
     pub async fn touch(&self, key: &str, operation: TouchOperation) -> Result<i64> {
-        let body = self.config.serialize_request(key, operation)?;
-        let url = &self.config.endpoint;
-        // Absolute wall-clock deadline: host suspend cannot pause it.
         let deadline_millis = unix_millis()
             .checked_add(TOUCH_DEADLINE.as_millis() as i64)
             .ok_or_else(|| anyhow!("touch deadline overflow"))?;
+        self.touch_with_deadline(key, operation, deadline_millis)
+            .await
+    }
 
-        // Bounded retries: exponential backoff, capped, never past the
-        // overall deadline. The touch is idempotent (the gateway applies
-        // last_used_ms = max(old, server_now)) so repeats are safe.
+    /// [`TouchClient::touch`] with an injectable total deadline (absolute
+    /// Unix milliseconds), so tests can exercise deadline expiry in
+    /// bounded time without changing the default 300 s budget.
+    async fn touch_with_deadline(
+        &self,
+        key: &str,
+        operation: TouchOperation,
+        deadline_millis: i64,
+    ) -> Result<i64> {
+        let body = self.config.serialize_request(key, operation)?;
+        let url = &self.config.endpoint;
+        // The caller-provided deadline is absolute wall-clock time:
+        // host suspend cannot pause it, and it is never reset per
+        // attempt. Bounded retries: exponential backoff, capped, never
+        // past the overall deadline. The touch is idempotent (the
+        // gateway applies last_used_ms = max(old, server_now)) so
+        // repeats are safe.
         let mut delay = Duration::from_millis(250);
         loop {
             if unix_millis() >= deadline_millis {
                 self.stats.record_failed();
                 return Err(anyhow!(
                     "billdfaster touch total deadline {} ms exhausted",
-                    TOUCH_DEADLINE.as_millis()
+                    deadline_millis
                 ));
             }
             let request_started = unix_millis();
@@ -264,8 +276,17 @@ impl TouchClient {
                 bounded_grant_expiry(ack.expires_at_ms, unix_millis(), request_started)
             };
 
+            // The deadline is enforced against the real clock at every
+            // poll (backwards-clock guard, unchanged) and with a real
+            // Tokio timer: a request future that stays pending forever
+            // (silent endpoint, half-open connection) is dropped at the
+            // total deadline because the timer wakes the task even
+            // though the network never does. The timer covers only the
+            // remainder of the single total budget, so retries can
+            // never reset it.
+            let remaining = deadline_millis.saturating_sub(request_started).max(0) as u64;
             let mut attempt = std::pin::pin!(attempt);
-            let attempt = std::future::poll_fn(|cx| {
+            let guarded = std::future::poll_fn(|cx| {
                 if unix_millis() >= deadline_millis {
                     return std::task::Poll::Ready(Err(anyhow!(
                         "touch absolute deadline exhausted"
@@ -273,12 +294,13 @@ impl TouchClient {
                 }
                 Future::poll(attempt.as_mut(), cx)
             });
-            match attempt.await {
-                Ok(expires_at_ms) => {
+            let attempt_result = tokio::time::timeout(Duration::from_millis(remaining), guarded);
+            match attempt_result.await {
+                Ok(Ok(expires_at_ms)) => {
                     self.stats.record_ok();
                     return Ok(expires_at_ms);
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     // Never retry past the total deadline: the check
                     // against absolute wall time gates every attempt.
                     if unix_millis() + delay.as_millis() as i64 >= deadline_millis {
@@ -287,6 +309,15 @@ impl TouchClient {
                     }
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(5));
+                }
+                Err(_elapsed) => {
+                    // The total touch deadline elapsed: pending attempt
+                    // dropped, no further retries, exactly one failure.
+                    self.stats.record_failed();
+                    return Err(anyhow!(
+                        "billdfaster touch total deadline {} ms exhausted",
+                        deadline_millis
+                    ));
                 }
             }
         }
@@ -379,6 +410,7 @@ async fn run_until<T>(
 #[cfg(test)]
 mod test {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn touch_config_from_parts_disabled_by_default() {
@@ -467,5 +499,83 @@ mod test {
         };
         assert!(run_until(20_000, || 20_000, transfer).await.is_err());
         assert!(!started.load(Ordering::SeqCst));
+    }
+
+    fn silent_client(endpoint: String) -> TouchClient {
+        TouchClient::new(
+            TouchConfig::from_parts(Some(endpoint), Some("t".into()), "ns".into()).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn touch_deadline_expires_without_external_wake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = silent_client(format!("http://{}/touch", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.touch_with_deadline(
+                "0123456789abcdef0123456789abcdef",
+                TouchOperation::Read,
+                unix_millis() + 500,
+            ),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result
+                .expect("silent request exceeded its deadline")
+                .is_err()
+        );
+        assert_eq!(client.stats_snapshot(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn touch_deadline_is_not_reset_across_attempts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = silent_client(format!("http://{}/touch", listener.local_addr().unwrap()));
+        let (second_attempt, observed_second_attempt) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(first.read(&mut request).await.unwrap() > 0);
+            // Consume most of the budget before the retry reaches a silent peer.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            first
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            first.shutdown().await.unwrap();
+            drop(first);
+            let (second, _) = listener.accept().await.unwrap();
+            second_attempt.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(second);
+        });
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.touch_with_deadline(
+                "0123456789abcdef0123456789abcdef",
+                TouchOperation::Read,
+                unix_millis() + 5_000,
+            ),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        server.abort();
+        let _ = server.await;
+        assert!(result.expect("retry exceeded the original budget").is_err());
+        observed_second_attempt
+            .await
+            .expect("retry never reached the silent peer");
+        // A fresh five-second timer after the retry would finish after 8s.
+        assert!(elapsed < Duration::from_millis(7_500), "{elapsed:?}");
+        assert_eq!(client.stats_snapshot(), (0, 1));
     }
 }

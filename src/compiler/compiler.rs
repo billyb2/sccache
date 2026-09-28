@@ -81,6 +81,54 @@ pub const CAN_DIST_DYLIBS: bool = true;
 ))]
 pub const CAN_DIST_DYLIBS: bool = false;
 
+/// Error signalling that a compilation's inputs are inherently unsupported for
+/// distributed compilation on this platform (as opposed to an incidental
+/// packaging/transport failure). Callers use it to fall back to local
+/// compilation without treating the situation as a dist error.
+#[cfg(feature = "dist-client")]
+#[derive(Debug)]
+pub struct UnsupportedInputsError(pub Vec<PathBuf>);
+
+#[cfg(feature = "dist-client")]
+impl std::error::Error for UnsupportedInputsError {}
+
+#[cfg(feature = "dist-client")]
+impl fmt::Display for UnsupportedInputsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot distribute the following inputs on this platform:"
+        )?;
+        for input in &self.0 {
+            write!(f, " {}", input.display())?;
+        }
+        Ok(())
+    }
+}
+
+/// Check whether the given paths are inherently unsupported as distributed
+/// compilation inputs on this platform.
+///
+/// This only inspects path extensions: a dylib input cannot be used on a
+/// platform where `CAN_DIST_DYLIBS` is false. It performs no I/O and rejects
+/// nothing else - unrelated files found in library search paths are not
+/// inputs and must not make a compilation ineligible.
+#[cfg(feature = "dist-client")]
+pub fn unsupported_dist_inputs(paths: &[PathBuf]) -> Option<UnsupportedInputsError> {
+    if CAN_DIST_DYLIBS {
+        return None;
+    }
+    let unsupported = paths
+        .iter()
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!unsupported.is_empty()).then(|| UnsupportedInputsError(unsupported))
+}
+
 #[async_trait]
 pub trait CompileCommand<T>: Send + Sync + 'static
 where
@@ -900,6 +948,24 @@ where
         }
     };
 
+    // Before allocating anything on any server (let alone uploading a large
+    // toolchain), ask the compilation whether it inherently cannot be
+    // distributed on this platform. A typed `UnsupportedInputsError` (as
+    // opposed to any other packaging error) means the inputs are unsupported
+    // on this platform, so skip straight to local compilation; this keeps
+    // caching fully enabled with zero dist allocation/upload attempts.
+    if let Err(e) = compilation.check_unsupported_inputs() {
+        if e.downcast_ref::<UnsupportedInputsError>().is_some() {
+            debug!(
+                "[{}]: Inputs cannot be distributed on this platform, compiling locally",
+                out_pretty
+            );
+            let output = compile_cmd.execute(service, &creator).await?;
+            return Ok((cacheable, DistType::NoDist, output));
+        }
+        return Err(e);
+    }
+
     debug!("[{}]: Attempting distributed compilation", out_pretty);
     let out_pretty2 = out_pretty.clone();
 
@@ -1122,6 +1188,18 @@ where
         self: Box<Self>,
         _path_transformer: dist::PathTransformer,
     ) -> Result<DistPackagers>;
+
+    /// Check whether this compilation's inputs are inherently unsupported for
+    /// distributed compilation on this platform.
+    ///
+    /// Must only report inputs whose unavailability is a property of the
+    /// platform (e.g. dylib inputs where `CAN_DIST_DYLIBS` is false), never
+    /// incidental failures like I/O or path transformation errors - those
+    /// must surface as regular errors, not as local-compilation eligibility.
+    #[cfg(feature = "dist-client")]
+    fn check_unsupported_inputs(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn is_locally_preprocessed(&self) -> bool {
         true

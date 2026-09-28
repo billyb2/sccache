@@ -426,6 +426,61 @@ thread_local! {
     static PANIC_LOCATION: Cell<Option<(String, u32, u32)>> = const { Cell::new(None) };
 }
 
+#[cfg(unix)]
+fn bind_unix_socket(
+    path: &std::path::Path,
+) -> io::Result<(tokio::net::UnixListener, std::fs::File)> {
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+
+    // Keep the lock for the listener's entire lifetime. A refused connect is
+    // not proof of a stale socket: a live Unix listener can have a full queue.
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".billdfaster.lock");
+    let mut lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::AddrInUse.into()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
+    let mut owned = String::new();
+    lock.read_to_string(&mut owned)?;
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => return Err(io::ErrorKind::AddrInUse.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            let identity = format!(
+                "billdfaster-socket-v1 {} {}\n",
+                metadata.dev(),
+                metadata.ino()
+            );
+            if !metadata.file_type().is_socket() || owned != identity {
+                return Err(io::ErrorKind::AddrInUse.into());
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    lock.set_len(0)?;
+    lock.rewind()?;
+    write!(
+        lock,
+        "billdfaster-socket-v1 {} {}\n",
+        metadata.dev(),
+        metadata.ino()
+    )?;
+    lock.sync_all()?;
+    Ok((listener, lock))
+}
+
 /// Start an sccache server, listening on `addr`.
 ///
 /// Spins an event loop handling client connections until a client
@@ -507,17 +562,20 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             #[cfg(unix)]
             crate::net::SocketAddr::Unix(path) => {
                 trace!("binding unix socket {}", path.display());
-                // Unix socket will report addr in use on any unlink file.
-                let _ = std::fs::remove_file(path);
-                let l = {
+                // An active listener must never be unlinked by another
+                // concurrent server startup.
+                let (l, socket_lock) = {
                     let _guard = runtime.enter();
-                    tokio::net::UnixListener::bind(path)?
+                    bind_unix_socket(path)?
                 };
                 let srv =
                     SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
                 Ok((
                     srv.local_addr().unwrap(),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+                    Box::new(move |f| {
+                        let _socket_lock = socket_lock;
+                        srv.run(f)
+                    }) as Box<dyn FnOnce(_) -> _>,
                 ))
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2496,6 +2554,155 @@ fn waits_until_zero() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_survives_duplicate_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let _listener = bind_unix_socket(&path).unwrap();
+        assert_eq!(
+            bind_unix_socket(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_unix_startups_keep_one_reachable_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let bound = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let contenders: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let start = start.clone();
+                let bound = bound.clone();
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let _enter = runtime.enter();
+                    start.wait();
+                    let result = bind_unix_socket(&path);
+                    bound.wait();
+                    match result {
+                        Ok(_listener) => {
+                            std::os::unix::net::UnixStream::connect(&path).unwrap();
+                            Ok(())
+                        }
+                        Err(error) => Err(error.kind()),
+                    }
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = contenders
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| **result == Err(io::ErrorKind::AddrInUse))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_replaces_only_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let listener = bind_unix_socket(&path).unwrap();
+        drop(listener);
+        let replacement = bind_unix_socket(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_does_not_unlink_owned_socket_while_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let (listener, lock) = bind_unix_socket(&path).unwrap();
+        // Force a refused connect while a recorded owner still holds its
+        // lifetime lock, as can also happen with a saturated live backlog.
+        drop(listener);
+        assert_eq!(
+            bind_unix_socket(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        drop(lock);
+        let _replacement = bind_unix_socket(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_refuses_unowned_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        assert_eq!(
+            bind_unix_socket(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_can_use_a_lock_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.lock");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let _listener = bind_unix_socket(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+    }
 
     struct StringWriter {
         buffer: String,
@@ -2528,7 +2735,13 @@ mod tests {
 
         let output = writer.get_output();
 
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(4).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "-"));
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(4)
+                .any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "-")
+        );
     }
 
     #[test]
@@ -2558,10 +2771,53 @@ mod tests {
 
         let output = writer.get_output();
 
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(5).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "46.15" && w[4] == "%"));
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(C/C++)" && w[4] == "100.00" && w[5] == "%"));
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(Cuda)" && w[4] == "0.00" && w[5] == "%"));
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(Rust)" && w[4] == "66.67" && w[5] == "%"));
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(5)
+                .any(|w| w[0] == "Cache"
+                    && w[1] == "hits"
+                    && w[2] == "rate"
+                    && w[3] == "46.15"
+                    && w[4] == "%")
+        );
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .any(|w| w[0] == "Cache"
+                    && w[1] == "hits"
+                    && w[2] == "rate"
+                    && w[3] == "(C/C++)"
+                    && w[4] == "100.00"
+                    && w[5] == "%")
+        );
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .any(|w| w[0] == "Cache"
+                    && w[1] == "hits"
+                    && w[2] == "rate"
+                    && w[3] == "(Cuda)"
+                    && w[4] == "0.00"
+                    && w[5] == "%")
+        );
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .any(|w| w[0] == "Cache"
+                    && w[1] == "hits"
+                    && w[2] == "rate"
+                    && w[3] == "(Rust)"
+                    && w[4] == "66.67"
+                    && w[5] == "%")
+        );
     }
 
     #[test]
@@ -2591,10 +2847,50 @@ mod tests {
 
         let output = writer.get_output();
 
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(4).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "-"));
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(7).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(c/c++" && w[4] == "[clang])" && w[5] == "100.00" && w[6] == "%"));
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(cuda)" && w[4] == "0.00" && w[5] == "%"));
-        assert!(output.split_whitespace().collect::<Vec<_>>().windows(6).any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "(rust)" && w[4] == "33.33" && w[5] == "%"));
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(4)
+                .any(|w| w[0] == "Cache" && w[1] == "hits" && w[2] == "rate" && w[3] == "-")
+        );
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(7)
+                .any(|w| w[0] == "Cache"
+                    && w[1] == "hits"
+                    && w[2] == "rate"
+                    && w[3] == "(c/c++"
+                    && w[4] == "[clang])"
+                    && w[5] == "100.00"
+                    && w[6] == "%")
+        );
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .any(|w| w[0] == "Cache"
+                    && w[1] == "hits"
+                    && w[2] == "rate"
+                    && w[3] == "(cuda)"
+                    && w[4] == "0.00"
+                    && w[5] == "%")
+        );
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .any(|w| w[0] == "Cache"
+                    && w[1] == "hits"
+                    && w[2] == "rate"
+                    && w[3] == "(rust)"
+                    && w[4] == "33.33"
+                    && w[5] == "%")
+        );
     }
 
     // Test that 2 servers with the same hits will always be printed in the same order.

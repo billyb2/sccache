@@ -173,6 +173,16 @@ impl OverlayBuilder {
         tc: &Toolchain,
         tccache: &Mutex<TcCache>,
     ) -> Result<OverlaySpec> {
+        // The archive id is a digest, never a path supplied by a client.
+        // Validate before removing an untracked extraction directory.
+        if tc.archive_id.len() != 64
+            || !tc
+                .archive_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("invalid toolchain archive id");
+        }
         let DeflatedToolchain {
             path: toolchain_dir,
             build_count: id,
@@ -190,18 +200,29 @@ impl OverlayBuilder {
                 entry.clone()
             } else {
                 trace!("Creating toolchain directory for {}", tc.archive_id);
+                // An earlier failed cache lookup can leave this directory
+                // untracked. Never reuse partially extracted compiler bytes.
+                if toolchain_dir.exists() {
+                    fs::remove_dir_all(&toolchain_dir)
+                        .context("Failed to remove untracked toolchain directory")?;
+                }
                 fs::create_dir(&toolchain_dir)?;
-
                 let mut tccache = tccache.lock().unwrap();
-                let toolchain_rdr = match tccache.get(tc) {
-                    Ok(rdr) => rdr,
-                    Err(LruError::FileNotInCache) => {
-                        bail!("expected toolchain {}, but not available", tc.archive_id)
-                    }
-                    Err(e) => {
-                        return Err(Error::from(e).context("failed to get toolchain from cache"));
-                    }
-                };
+                let toolchain_rdr =
+                    match tccache.get(tc) {
+                        Ok(rdr) => rdr,
+                        Err(error) => {
+                            fs::remove_dir_all(&toolchain_dir)
+                                .context("Failed to remove empty toolchain directory")?;
+                            return match error {
+                                LruError::FileNotInCache => {
+                                    bail!("expected toolchain {}, but not available", tc.archive_id)
+                                }
+                                other => Err(Error::from(other)
+                                    .context("failed to get toolchain from cache")),
+                            };
+                        }
+                    };
 
                 tar::Archive::new(GzDecoder::new(toolchain_rdr))
                     .unpack(&toolchain_dir)
@@ -871,5 +892,92 @@ impl BuilderIncoming for DockerBuilder {
         self.finish_container(&tc, cid);
         debug!("Returning result");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_toolchain_lookup_does_not_poison_the_next_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let builder_dir = dir.path().join("builder");
+        fs::create_dir(&builder_dir).unwrap();
+        fs::create_dir(builder_dir.join("toolchains")).unwrap();
+        fs::create_dir(builder_dir.join("builds")).unwrap();
+        let builder = OverlayBuilder {
+            bubblewrap: PathBuf::from("/bin/false"),
+            dir: builder_dir,
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+        };
+        let cache = Mutex::new(TcCache::new(&dir.path().join("cache"), 1024).unwrap());
+        let archive = dir.path().join("toolchain.tar.gz");
+        {
+            let output = fs::File::create(&archive).unwrap();
+            let encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "bin/cc", &b"data"[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let tc = Toolchain {
+            archive_id: sccache::util::Digest::reader_sync(fs::File::open(&archive).unwrap())
+                .unwrap(),
+        };
+        let toolchain_dir = builder.dir.join("toolchains").join(&tc.archive_id);
+        fs::create_dir(&toolchain_dir).unwrap();
+        fs::write(toolchain_dir.join("incomplete"), b"partial").unwrap();
+
+        for _ in 0..2 {
+            let error = builder.prepare_overlay_dirs(&tc, &cache).unwrap_err();
+            assert!(error.to_string().contains("not available"), "{error:#}");
+            assert!(!toolchain_dir.exists());
+        }
+        cache
+            .lock()
+            .unwrap()
+            .insert_with(&tc, |mut output| {
+                io::copy(&mut fs::File::open(&archive)?, &mut output)?;
+                Ok(())
+            })
+            .unwrap();
+        let prepared = builder.prepare_overlay_dirs(&tc, &cache).unwrap();
+        assert_eq!(
+            fs::read(prepared.toolchain_dir.join("bin/cc")).unwrap(),
+            b"data"
+        );
+        assert!(!toolchain_dir.join("incomplete").exists());
+    }
+
+    #[test]
+    fn invalid_toolchain_id_cannot_remove_another_builder_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let builder_dir = dir.path().join("builder");
+        fs::create_dir_all(builder_dir.join("toolchains")).unwrap();
+        fs::create_dir_all(builder_dir.join("builds")).unwrap();
+        fs::write(builder_dir.join("builds/owned"), b"keep").unwrap();
+        let builder = OverlayBuilder {
+            bubblewrap: PathBuf::from("/bin/false"),
+            dir: builder_dir.clone(),
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+        };
+        let cache = Mutex::new(TcCache::new(&dir.path().join("cache"), 1024).unwrap());
+        let tc = Toolchain {
+            archive_id: "../builds".into(),
+        };
+
+        assert!(
+            builder
+                .prepare_overlay_dirs(&tc, &cache)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid toolchain archive id")
+        );
+        assert_eq!(fs::read(builder_dir.join("builds/owned")).unwrap(), b"keep");
     }
 }
