@@ -84,6 +84,7 @@ opendal = { version = "0.58.1", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.58.1", optional = true }
 opendal-layer-logging = { version = "0.58.1", optional = true }
 openssl = { version = "0.10.75", optional = true }
+quinn = { version = "=0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.8.4"
 regex = "1.10.3"
 reqwest = { version = "0.13", features = [
@@ -93,6 +94,7 @@ reqwest = { version = "0.13", features = [
   "rustls",
   "hickory-dns",
 ], optional = true }
+rustls = { version = "=0.23.31", optional = true, default-features = false, features = ["ring", "std"] }
 rustls-native-certs = { version = "0.8", optional = true }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -143,6 +145,7 @@ cc = "1.0"
 chrono = "0.4.42"
 divan = { package = "codspeed-divan-compat", version = "4" }
 filetime = "0.2"
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 predicates = "=3.1.0"
 serial_test = "3.1"
 temp-env = "0.3.6"
@@ -243,6 +246,8 @@ dist-client = [
   "url",
   "sha2",
   "rustls-native-certs",
+  "quinn",
+  "rustls",
 ]
 # Enables the sccache-dist binary
 dist-server = [

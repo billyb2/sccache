@@ -774,6 +774,11 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    /// Route every asynchronous scheduler and worker RPC through the
+    /// billdfaster gateway's QUIC transport instead of the pinned-certificate
+    /// HTTP transport. Off by default; a failure over QUIC is always surfaced
+    /// and never silently retried over HTTP.
+    pub quic: bool,
 }
 
 impl Default for DistConfig {
@@ -785,6 +790,7 @@ impl Default for DistConfig {
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            quic: false,
         }
     }
 }
@@ -2966,6 +2972,7 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
+                quic: false,
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],

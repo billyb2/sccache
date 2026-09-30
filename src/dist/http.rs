@@ -69,17 +69,39 @@ mod common {
     pub async fn bincode_req_fut<T: serde::de::DeserializeOwned + 'static>(
         req: reqwest::RequestBuilder,
     ) -> Result<T> {
-        // Work around tiny_http issue #151 by disabling HTTP pipeline with
-        // `Connection: close`.
-        let res = req.header(header::CONNECTION, "close").send().await?;
+        let (res, _bytes_out) = bincode_req_fut_with_bytes(req).await?;
+        Ok(res)
+    }
+
+    /// Like [`bincode_req_fut`], also returning the decoded HTTP response
+    /// body size in bytes (excluding headers and transfer framing).
+    #[cfg(feature = "dist-client")]
+    pub async fn bincode_req_fut_with_bytes<T: serde::de::DeserializeOwned + 'static>(
+        req: reqwest::RequestBuilder,
+    ) -> Result<(T, u64)> {
+        // Consume the complete response below so the connection can return to
+        // the pool. The pinned tiny_http already serializes TLS responses.
+        let res = req.send().await?;
 
         let status = res.status();
         let bytes = res.bytes().await?;
+        let bytes_out = bytes.len() as u64;
+        Ok((decode_response(status, &bytes)?, bytes_out))
+    }
+
+    /// Decode one HTTP-compatible bincode response. Shared by the pinned
+    /// HTTP transport and the QUIC transport so status and error behaviour
+    /// stay identical on both.
+    #[cfg(feature = "dist-client")]
+    pub fn decode_response<T: serde::de::DeserializeOwned>(
+        status: reqwest::StatusCode,
+        bytes: &[u8],
+    ) -> Result<T> {
         if !status.is_success() {
             let errmsg = format!(
                 "Error {}: {}",
                 status.as_u16(),
-                String::from_utf8_lossy(&bytes)
+                String::from_utf8_lossy(bytes)
             );
             if status.is_client_error() {
                 anyhow::bail!(HttpClientError(errmsg));
@@ -87,7 +109,7 @@ mod common {
                 anyhow::bail!(errmsg);
             }
         } else {
-            Ok(bincode::deserialize(&bytes)?)
+            Ok(bincode::deserialize(bytes)?)
         }
     }
 
@@ -292,7 +314,9 @@ mod server {
         }
     }
 
-    fn create_https_cert_and_privkey(addr: SocketAddr) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    pub(super) fn create_https_cert_and_privkey(
+        addr: SocketAddr,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let rsa_key = openssl::rsa::Rsa::<openssl::pkey::Private>::generate(2048)
             .context("failed to generate rsa privkey")?;
         let privkey_pem = rsa_key
@@ -1086,6 +1110,8 @@ mod server {
 #[cfg(feature = "dist-client")]
 mod client {
     use super::super::cache;
+    use super::super::quic;
+    use crate::bf_timing::{BfTiming, BfTimingOpt};
     use crate::config;
     use crate::dist::pkg::{InputsPackager, ToolchainPackager};
     use crate::dist::{
@@ -1107,13 +1133,17 @@ mod client {
 
     use super::common::{
         AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
-        ServerCertificateHttpResponse, bincode_req_fut,
+        ServerCertificateHttpResponse, bincode_req_fut, bincode_req_fut_with_bytes,
+        decode_response,
     };
     use super::urls;
     use crate::errors::*;
 
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
     const CONNECT_TIMEOUT_SECS: u64 = 5;
+    // The daemon owns one long-lived Tokio runtime, including cert updates.
+    // Bound retained sockets while allowing concurrent jobs to reuse them.
+    const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 32;
 
     pub struct Client {
         auth_token: String,
@@ -1124,6 +1154,11 @@ mod client {
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
+        /// Selected once at construction: every asynchronous scheduler and
+        /// worker RPC travels over QUIC when this is set, and the pinned HTTP
+        /// transport above is left untouched but unused. Certificate updates
+        /// never reset this state.
+        quic: Option<Arc<quic::QuicClient>>,
     }
 
     impl Client {
@@ -1135,20 +1170,31 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
+            quic: bool,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
             let client = reqwest::ClientBuilder::new()
                 .timeout(timeout)
                 .connect_timeout(connect_timeout)
-                // Disable connection pool to avoid broken connection
-                // between runtime
-                .pool_max_idle_per_host(0)
+                .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
                 .build()
                 .context("failed to create an async HTTP client")?;
             let client_toolchains =
                 cache::ClientToolchains::new(cache_dir, cache_size, toolchain_configs)
                     .context("failed to initialise client toolchains")?;
+            let quic = if quic {
+                info!(
+                    "Distributed transport over QUIC is enabled for {}",
+                    scheduler_url
+                );
+                Some(Arc::new(quic::QuicClient::new(
+                    scheduler_url.clone(),
+                    auth_token.clone(),
+                )))
+            } else {
+                None
+            };
             Ok(Self {
                 auth_token,
                 scheduler_url,
@@ -1157,6 +1203,7 @@ mod client {
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
+                quic,
             })
         }
 
@@ -1181,8 +1228,8 @@ mod client {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let new_client_async = client_async_builder
                 .timeout(timeout)
-                // Disable keep-alive
-                .pool_max_idle_per_host(0)
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+                .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
                 .build()
                 .context("failed to create an async HTTP client")?;
             // Use the updated certificates
@@ -1190,40 +1237,134 @@ mod client {
             certs.insert(cert_digest, cert_pem);
             Ok(())
         }
+
+        /// Run one RPC over the QUIC transport, decoding exactly like the
+        /// HTTP transport: same status/error behaviour, same byte accounting.
+        async fn quic_rpc<T: serde::de::DeserializeOwned + 'static>(
+            &self,
+            request: quic::Request,
+        ) -> Result<(T, u64)> {
+            let quic = self
+                .quic
+                .as_ref()
+                .context("QUIC transport is not enabled for this client")?;
+            let response = quic.request(request).await?;
+            let status = reqwest::StatusCode::from_u16(response.status).with_context(|| {
+                format!(
+                    "QUIC response carried an invalid status {}",
+                    response.status
+                )
+            })?;
+            let bytes_out = response.body.len() as u64;
+            Ok((decode_response(status, &response.body)?, bytes_out))
+        }
+
+        /// Path component of a scheduler or worker url, as carried on the wire.
+        fn request_path(url: &reqwest::Url) -> String {
+            url.path().to_owned()
+        }
+
+        /// POST /api/v1/scheduler/alloc_job over the selected transport.
+        async fn alloc_job_request(&self, tc: &Toolchain) -> Result<AllocJobHttpResponse> {
+            match &self.quic {
+                Some(_) => {
+                    let request = quic::Request {
+                        target: None,
+                        method: quic::Method::Post,
+                        path: Self::request_path(&urls::scheduler_alloc_job(&self.scheduler_url)),
+                        authorization: Some(format!("Bearer {}", self.auth_token)),
+                        body: quic::Body::Bytes(
+                            bincode::serialize(tc)
+                                .context("Failed to serialize body to bincode")?,
+                        ),
+                    };
+                    let (response, _bytes_out) =
+                        self.quic_rpc::<AllocJobHttpResponse>(request).await?;
+                    Ok(response)
+                }
+                None => {
+                    let url = urls::scheduler_alloc_job(&self.scheduler_url);
+                    let mut req = self.client.lock().unwrap().post(url);
+                    req = req.bearer_auth(self.auth_token.clone()).bincode(tc)?;
+                    bincode_req_fut(req).await
+                }
+            }
+        }
+
+        /// GET /api/v1/scheduler/server_certificate/{addr} over the selected
+        /// transport.
+        async fn server_certificate_request(
+            &self,
+            server_id: dist::ServerId,
+        ) -> Result<ServerCertificateHttpResponse> {
+            match &self.quic {
+                Some(_) => {
+                    let request = quic::Request {
+                        target: None,
+                        method: quic::Method::Get,
+                        path: Self::request_path(&urls::scheduler_server_certificate(
+                            &self.scheduler_url,
+                            server_id,
+                        )),
+                        authorization: None,
+                        body: quic::Body::Empty,
+                    };
+                    let (response, _bytes_out) = self
+                        .quic_rpc::<ServerCertificateHttpResponse>(request)
+                        .await?;
+                    Ok(response)
+                }
+                None => {
+                    let url = urls::scheduler_server_certificate(&self.scheduler_url, server_id);
+                    let req = self.client.lock().unwrap().get(url);
+                    bincode_req_fut(req).await
+                }
+            }
+        }
+
+        /// Test hook: trust `descriptor` for the QUIC transport instead of
+        /// running HTTPS discovery.
+        #[cfg(test)]
+        pub(crate) fn set_quic_descriptor(&self, descriptor: quic::Descriptor) {
+            if let Some(quic) = &self.quic {
+                quic.set_descriptor(descriptor);
+            }
+        }
     }
 
     #[async_trait]
     impl dist::Client for Client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
-            let scheduler_url = self.scheduler_url.clone();
-            let url = urls::scheduler_alloc_job(&scheduler_url);
-            let mut req = self.client.lock().unwrap().post(url);
-            req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
-
             let client = self.client.clone();
             let server_certs = self.server_certs.clone();
 
-            match bincode_req_fut(req).await? {
+            let mut timing = BfTiming::start("do_alloc_job");
+            match self.alloc_job_request(&tc).await? {
                 AllocJobHttpResponse::Success {
                     job_alloc,
                     need_toolchain,
                     cert_digest,
                 } => {
+                    timing.finish();
+                    timing = BfTiming::start_with_job(
+                        "server_certificate_fetch",
+                        Some(job_alloc.job_id.0),
+                    );
                     let server_id = job_alloc.server_id;
                     let alloc_job_res = Ok(AllocJobResult::Success {
                         job_alloc,
                         need_toolchain,
                     });
                     if server_certs.lock().unwrap().contains_key(&cert_digest) {
+                        timing.finish();
                         return alloc_job_res;
                     }
                     info!(
                         "Need to request new certificate for server {}",
                         server_id.addr()
                     );
-                    let url = urls::scheduler_server_certificate(&scheduler_url, server_id);
-                    let req = client.lock().unwrap().get(url);
-                    let res: ServerCertificateHttpResponse = bincode_req_fut(req)
+                    let res: ServerCertificateHttpResponse = self
+                        .server_certificate_request(server_id)
                         .await
                         .context("GET to scheduler server_certificate failed")?;
 
@@ -1234,6 +1375,8 @@ mod client {
                     // dropping a runtime in asynchronous context.
                     // For the time being, we work around this by off-loading it
                     // to a dedicated blocking-friendly thread pool.
+                    // The pinned worker certificates are only consumed by the
+                    // HTTP transport; this never touches the QUIC state.
                     let _ = self
                         .pool
                         .spawn_blocking(move || {
@@ -1248,17 +1391,37 @@ mod client {
                         })
                         .await;
 
+                    timing.finish();
                     alloc_job_res
                 }
-                AllocJobHttpResponse::Fail { msg } => Ok(AllocJobResult::Fail { msg }),
+                AllocJobHttpResponse::Fail { msg } => {
+                    timing.finish();
+                    Ok(AllocJobResult::Fail { msg })
+                }
             }
         }
 
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
-            let scheduler_url = self.scheduler_url.clone();
-            let url = urls::scheduler_status(&scheduler_url);
-            let req = self.client.lock().unwrap().get(url);
-            bincode_req_fut(req).await
+            match &self.quic {
+                Some(_) => {
+                    let request = quic::Request {
+                        target: None,
+                        method: quic::Method::Get,
+                        path: Self::request_path(&urls::scheduler_status(&self.scheduler_url)),
+                        authorization: None,
+                        body: quic::Body::Empty,
+                    };
+                    let (status, _bytes_out) =
+                        self.quic_rpc::<SchedulerStatusResult>(request).await?;
+                    Ok(status)
+                }
+                None => {
+                    let scheduler_url = self.scheduler_url.clone();
+                    let url = urls::scheduler_status(&scheduler_url);
+                    let req = self.client.lock().unwrap().get(url);
+                    bincode_req_fut(req).await
+                }
+            }
         }
 
         async fn do_submit_toolchain(
@@ -1268,13 +1431,50 @@ mod client {
         ) -> Result<SubmitToolchainResult> {
             match self.tc_cache.get_toolchain(&tc) {
                 Ok(Some(toolchain_file)) => {
-                    let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id);
-                    let req = self.client.lock().unwrap().post(url);
-                    let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
-                    let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
-                    let body = Body::wrap_stream(toolchain_file_stream);
-                    let req = req.bearer_auth(job_alloc.auth).body(body);
-                    bincode_req_fut(req).await
+                    let timing =
+                        BfTiming::start_with_job("do_submit_toolchain", Some(job_alloc.job_id.0));
+                    let res = match &self.quic {
+                        Some(_) => {
+                            // Stream the cached toolchain archive straight from
+                            // the file; nothing is buffered whole.
+                            let toolchain_file: std::fs::File = toolchain_file.into();
+                            let len = toolchain_file
+                                .metadata()
+                                .context("failed to stat the toolchain file")?
+                                .len();
+                            let request = quic::Request {
+                                target: Some(job_alloc.server_id.addr()),
+                                method: quic::Method::Post,
+                                path: Self::request_path(&urls::server_submit_toolchain(
+                                    job_alloc.server_id,
+                                    job_alloc.job_id,
+                                )),
+                                authorization: Some(format!("Bearer {}", job_alloc.auth)),
+                                body: quic::Body::Stream {
+                                    reader: Box::new(tokio::fs::File::from_std(toolchain_file)),
+                                    len,
+                                },
+                            };
+                            let (res, _bytes_out) =
+                                self.quic_rpc::<SubmitToolchainResult>(request).await?;
+                            Ok(res)
+                        }
+                        None => {
+                            let url = urls::server_submit_toolchain(
+                                job_alloc.server_id,
+                                job_alloc.job_id,
+                            );
+                            let req = self.client.lock().unwrap().post(url);
+                            let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
+                            let toolchain_file_stream =
+                                tokio_util::io::ReaderStream::new(toolchain_file);
+                            let body = Body::wrap_stream(toolchain_file_stream);
+                            let req = req.bearer_auth(job_alloc.auth).body(body);
+                            bincode_req_fut(req).await
+                        }
+                    };
+                    timing.finish();
+                    res
                 }
                 Ok(None) => Err(anyhow!("couldn't find toolchain locally")),
                 Err(e) => Err(e),
@@ -1288,9 +1488,11 @@ mod client {
             outputs: Vec<String>,
             inputs_packager: Box<dyn InputsPackager>,
         ) -> Result<(RunJobResult, PathTransformer)> {
-            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
+            let job_id_num = job_alloc.job_id.0;
 
-            let (body, path_transformer) = self
+            let mut timing_pack = BfTiming::start_with_job("run_job_pack", Some(job_id_num));
+            let measure_input_bytes = timing_pack.is_some();
+            let (body, path_transformer, uncompressed_input_bytes) = self
                 .pool
                 .spawn_blocking(move || -> Result<_> {
                     let bincode = bincode::serialize(&RunJobHttpRequest { command, outputs })
@@ -1303,12 +1505,18 @@ mod client {
                     body.write_all(&bincode)
                         .expect("Infallible write of bincode body to vec failed");
                     let path_transformer;
+                    let uncompressed_input_bytes;
                     {
                         let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
                         path_transformer = inputs_packager
                             .write_inputs(&mut compressor)
                             .context("Could not write inputs for compilation")?;
                         compressor.flush().context("failed to flush compressor")?;
+                        uncompressed_input_bytes = if measure_input_bytes {
+                            compressor.total_in()
+                        } else {
+                            0
+                        };
                         trace!(
                             "Compressed inputs from {} -> {}",
                             compressor.total_in(),
@@ -1317,14 +1525,57 @@ mod client {
                         compressor.finish().context("failed to finish compressor")?;
                     }
 
-                    Ok((body, path_transformer))
+                    Ok((body, path_transformer, uncompressed_input_bytes))
                 })
                 .await??;
-            let mut req = self.client.lock().unwrap().post(url);
-            req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req)
-                .map_ok(|res| (res, path_transformer))
-                .await
+            let compressed_input_bytes = body.len() as u64;
+            timing_pack.set_bytes_in(uncompressed_input_bytes);
+            timing_pack.set_bytes_out(compressed_input_bytes);
+            timing_pack.finish();
+
+            let mut timing_http = BfTiming::start_with_job(
+                // The phase name must describe the transport actually used.
+                if self.quic.is_some() {
+                    "do_run_quic"
+                } else {
+                    "do_run_http"
+                },
+                Some(job_id_num),
+            );
+            timing_http.set_bytes_in(compressed_input_bytes);
+            let res = match &self.quic {
+                Some(_) => {
+                    let request = quic::Request {
+                        target: Some(job_alloc.server_id.addr()),
+                        method: quic::Method::Post,
+                        path: Self::request_path(&urls::server_run_job(
+                            job_alloc.server_id,
+                            job_alloc.job_id,
+                        )),
+                        authorization: Some(format!("Bearer {}", job_alloc.auth)),
+                        body: quic::Body::Bytes(body),
+                    };
+                    self.quic_rpc::<RunJobResult>(request)
+                        .map_ok(|(res, bytes_out)| {
+                            timing_http.set_bytes_out(bytes_out);
+                            (res, path_transformer)
+                        })
+                        .await
+                }
+                None => {
+                    let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
+                    let mut req = self.client.lock().unwrap().post(url);
+                    req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
+                    bincode_req_fut_with_bytes(req)
+                        .map_ok(|(res, bytes_out)| {
+                            timing_http.set_bytes_out(bytes_out);
+                            (res, path_transformer)
+                        })
+                        .await
+                }
+            };
+            timing_http.finish();
+            res
         }
 
         async fn put_toolchain(
@@ -1352,6 +1603,407 @@ mod client {
                 Some(Ok((_, _, path))) => Some(path),
                 _ => None,
             }
+        }
+    }
+
+    #[cfg(all(test, feature = "dist-server"))]
+    mod tests {
+        use super::*;
+        use crate::dist::Client as _;
+        use std::net::SocketAddr;
+        use std::sync::mpsc::Sender;
+        use std::thread::JoinHandle;
+
+        struct HttpFixture {
+            url: reqwest::Url,
+            requests: Arc<Mutex<Vec<(SocketAddr, usize)>>>,
+            stop: Sender<()>,
+            thread: Option<JoinHandle<()>>,
+        }
+
+        impl HttpFixture {
+            fn new(tls: Option<(Vec<u8>, Vec<u8>)>) -> Self {
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let seen = requests.clone();
+                let handler = move |request: &rouille::Request| {
+                    let mut body = Vec::new();
+                    std::io::Read::read_to_end(&mut request.data().unwrap(), &mut body).unwrap();
+                    seen.lock()
+                        .unwrap()
+                        .push((*request.remote_addr(), body.len()));
+                    super::super::server::bincode_response(&SchedulerStatusResult {
+                        num_servers: 1,
+                        num_cpus: 8,
+                        in_progress: 0,
+                    })
+                };
+                let (scheme, server) = if let Some((cert, key)) = tls {
+                    (
+                        "https",
+                        rouille::Server::new_ssl("127.0.0.1:0", handler, cert, key).unwrap(),
+                    )
+                } else {
+                    (
+                        "http",
+                        rouille::Server::new("127.0.0.1:0", handler).unwrap(),
+                    )
+                };
+                let url = format!("{scheme}://{}", server.server_addr())
+                    .parse()
+                    .unwrap();
+                let (thread, stop) = server.stoppable();
+                Self {
+                    url,
+                    requests,
+                    stop,
+                    thread: Some(thread),
+                }
+            }
+
+            fn assert_reused_pair(&self, offset: usize) {
+                let requests = self.requests.lock().unwrap();
+                assert_eq!(
+                    requests[offset].0,
+                    requests[offset + 1].0,
+                    "sequential requests opened different TCP connections"
+                );
+            }
+        }
+
+        impl Drop for HttpFixture {
+            fn drop(&mut self) {
+                let _ = self.stop.send(());
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn requests_reuse_connections_before_and_after_certificate_update() {
+            let plain = HttpFixture::new(None);
+            let directory = tempfile::tempdir().unwrap();
+            let client = Client::new(
+                &tokio::runtime::Handle::current(),
+                plain.url.clone(),
+                directory.path(),
+                1024 * 1024,
+                &[],
+                "test".into(),
+                false,
+                false,
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let status = tokio::time::timeout(Duration::from_secs(5), client.do_get_status())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(status.num_cpus, 8);
+            }
+            plain.assert_reused_pair(0);
+
+            let (digest, cert, key) =
+                super::super::server::create_https_cert_and_privkey("127.0.0.1:0".parse().unwrap())
+                    .unwrap();
+            let secure = HttpFixture::new(Some((cert.clone(), key)));
+            let http = client.client.clone();
+            let certs = client.server_certs.clone();
+            tokio::task::spawn_blocking(move || {
+                Client::update_certs(
+                    &mut http.lock().unwrap(),
+                    &mut certs.lock().unwrap(),
+                    digest,
+                    cert,
+                )
+                .unwrap();
+            })
+            .await
+            .unwrap();
+            for _ in 0..2 {
+                let status = tokio::time::timeout(Duration::from_secs(5), client.do_get_status())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(status.num_cpus, 8);
+            }
+            plain.assert_reused_pair(2);
+
+            // Exercise the real worker HTTPS stack and streaming upload path:
+            // the following GET must reuse the POST's fully consumed response.
+            let upload = Body::wrap_stream(futures::stream::iter([Ok::<_, std::io::Error>(vec![
+                    42;
+                    4096
+                ])]));
+            let req = client
+                .client
+                .lock()
+                .unwrap()
+                .post(secure.url.clone())
+                .body(upload);
+            let status: SchedulerStatusResult =
+                tokio::time::timeout(Duration::from_secs(5), bincode_req_fut(req))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(status.num_cpus, 8);
+            let req = client.client.lock().unwrap().get(secure.url.clone());
+            let status: SchedulerStatusResult =
+                tokio::time::timeout(Duration::from_secs(5), bincode_req_fut(req))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(status.num_cpus, 8);
+            secure.assert_reused_pair(0);
+            assert_eq!(secure.requests.lock().unwrap()[0].1, 4096);
+        }
+
+        /// Both transports share one response decoder: 4xx responses become
+        /// `HttpClientError`, other failures stay plain, exactly as before.
+        #[test]
+        fn error_status_decoding_is_shared_by_both_transports() {
+            let error =
+                decode_response::<SchedulerStatusResult>(reqwest::StatusCode::NOT_FOUND, b"nope")
+                    .unwrap_err();
+            assert!(error.downcast_ref::<HttpClientError>().is_some());
+            let error =
+                decode_response::<SchedulerStatusResult>(reqwest::StatusCode::BAD_GATEWAY, b"nope")
+                    .unwrap_err();
+            assert!(error.downcast_ref::<HttpClientError>().is_none());
+        }
+
+        /// End-to-end QUIC coverage: status, alloc + certificate fetch,
+        /// streamed toolchain upload and a run job all travel over one QUIC
+        /// connection, and the pinned HTTP transport is never touched.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn quic_transport_serves_all_dist_rpcs() {
+            use crate::dist::quic::test_fixture::{Fixture, RecordedRequest, Responder};
+            use crate::dist::{
+                JobAlloc, JobComplete, JobId, ProcessOutput, RunJobResult, ServerId,
+                SubmitToolchainResult,
+            };
+            use byteorder::{BigEndian, ReadBytesExt};
+
+            struct FixedInputsPackager(Vec<u8>);
+            impl crate::dist::pkg::InputsPackager for FixedInputsPackager {
+                fn write_inputs(
+                    self: Box<Self>,
+                    wtr: &mut dyn std::io::Write,
+                ) -> Result<PathTransformer> {
+                    wtr.write_all(&self.0)?;
+                    Ok(PathTransformer::new())
+                }
+            }
+
+            struct BytesToolchainPackager(Vec<u8>);
+            impl ToolchainPackager for BytesToolchainPackager {
+                fn write_pkg(self: Box<Self>, mut file: fs_err::File) -> Result<()> {
+                    file.write_all(&self.0)?;
+                    Ok(())
+                }
+            }
+
+            let worker = ServerId::new("127.0.0.1:41000".parse().unwrap());
+            let worker_cert =
+                rcgen::generate_simple_self_signed(vec!["worker.local".to_string()]).unwrap();
+            // rcgen is built without its PEM feature; the client's certificate
+            // update path needs PEM text.
+            let worker_pem = crate::dist::quic::test_fixture::der_to_pem(worker_cert.cert.der());
+            let digest = b"worker-cert-digest".to_vec();
+
+            let responder: Responder = {
+                let digest = digest.clone();
+                let worker_pem = worker_pem.clone();
+                Arc::new(
+                    move |request: &RecordedRequest| match request.path.as_str() {
+                        "/api/v1/scheduler/status" => (
+                            200,
+                            bincode::serialize(&SchedulerStatusResult {
+                                num_servers: 1,
+                                num_cpus: 8,
+                                in_progress: 0,
+                            })
+                            .unwrap(),
+                        ),
+                        "/api/v1/scheduler/alloc_job" => (
+                            200,
+                            bincode::serialize(&AllocJobHttpResponse::Success {
+                                job_alloc: JobAlloc {
+                                    auth: "job-token".to_string(),
+                                    job_id: JobId(11),
+                                    server_id: worker,
+                                },
+                                need_toolchain: true,
+                                cert_digest: digest.clone(),
+                            })
+                            .unwrap(),
+                        ),
+                        path if path.starts_with("/api/v1/scheduler/server_certificate/") => (
+                            200,
+                            bincode::serialize(&ServerCertificateHttpResponse {
+                                cert_digest: digest.clone(),
+                                cert_pem: worker_pem.clone().into_bytes(),
+                            })
+                            .unwrap(),
+                        ),
+                        path if path.starts_with("/api/v1/distserver/submit_toolchain/") => (
+                            200,
+                            bincode::serialize(&SubmitToolchainResult::Success).unwrap(),
+                        ),
+                        path if path.starts_with("/api/v1/distserver/run_job/") => (
+                            200,
+                            bincode::serialize(&RunJobResult::Complete(JobComplete {
+                                output: ProcessOutput::fake_output(
+                                    0,
+                                    b"compiler stdout".to_vec(),
+                                    b"compiler stderr".to_vec(),
+                                ),
+                                outputs: vec![],
+                            }))
+                            .unwrap(),
+                        ),
+                        other => (404, format!("unexpected path {other}").into_bytes()),
+                    },
+                )
+            };
+
+            let fixture = Fixture::start_with(Some(responder)).await;
+            let directory = tempfile::tempdir().unwrap();
+            let client = Client::new(
+                &tokio::runtime::Handle::current(),
+                reqwest::Url::parse("https://localhost").unwrap(),
+                directory.path(),
+                // Large enough for the streamed archive below: the toolchain
+                // cache rejects entries bigger than its capacity.
+                64 * 1024 * 1024,
+                &[],
+                "scheduler-token".into(),
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(client.quic.is_some(), "QUIC transport was not selected");
+            client.set_quic_descriptor(fixture.descriptor());
+
+            let status = client.do_get_status().await.unwrap();
+            assert_eq!((status.num_servers, status.num_cpus), (1, 8));
+
+            let alloc = client
+                .do_alloc_job(Toolchain {
+                    archive_id: "deadbeef".to_string(),
+                })
+                .await
+                .unwrap();
+            let job_alloc = match alloc {
+                AllocJobResult::Success {
+                    job_alloc,
+                    need_toolchain,
+                } => {
+                    assert!(need_toolchain);
+                    job_alloc
+                }
+                AllocJobResult::Fail { msg } => panic!("alloc job failed: {msg}"),
+            };
+            assert_eq!(job_alloc.server_id, worker);
+            assert!(
+                client.server_certs.lock().unwrap().contains_key(&digest),
+                "the QUIC certificate fetch did not update the pinned certificates"
+            );
+
+            let inputs: Vec<u8> = (0..256 * 1024).map(|index| (index % 253) as u8).collect();
+            let (result, _transformer) = client
+                .do_run_job(
+                    job_alloc.clone(),
+                    CompileCommand {
+                        executable: "/usr/bin/cc".to_string(),
+                        arguments: vec!["-c".to_string()],
+                        env_vars: vec![],
+                        cwd: "/tmp".to_string(),
+                    },
+                    vec!["out.o".to_string()],
+                    Box::new(FixedInputsPackager(inputs.clone())),
+                )
+                .await
+                .unwrap();
+            match result {
+                RunJobResult::Complete(complete) => {
+                    assert_eq!(complete.output.stdout, b"compiler stdout")
+                }
+                _ => panic!("unexpected run job result"),
+            }
+
+            let archive: Vec<u8> = (0..2 * 1024 * 1024)
+                .map(|index| (index % 249) as u8)
+                .collect();
+            let (toolchain, _) = client
+                .put_toolchain(
+                    directory.path().join("fake-compiler"),
+                    "weak-key".to_string(),
+                    Box::new(BytesToolchainPackager(archive.clone())),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                client
+                    .do_submit_toolchain(job_alloc.clone(), toolchain)
+                    .await
+                    .unwrap(),
+                SubmitToolchainResult::Success
+            ));
+
+            let log = fixture.request_log();
+            assert_eq!(
+                log.len(),
+                5,
+                "unexpected QUIC requests: {:?}",
+                log.iter()
+                    .map(|request| request.path.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                fixture.connection_count(),
+                1,
+                "sequential QUIC RPCs reopened the connection"
+            );
+            for request in &log {
+                assert_eq!(request.version, 1);
+                assert_eq!(request.client_token, "scheduler-token");
+            }
+
+            let run = log
+                .iter()
+                .find(|request| request.path.starts_with("/api/v1/distserver/run_job/"))
+                .expect("run job request missing");
+            assert_eq!(run.target.as_deref(), Some("127.0.0.1:41000"));
+            assert_eq!(run.method, "POST");
+            assert_eq!(run.authorization.as_deref(), Some("Bearer job-token"));
+            assert_eq!(run.content_length, Some(run.body.len() as u64));
+            // The worker-shaped body is a 4-byte big-endian bincode length,
+            // the bincode request, then the zlib-compressed inputs, exactly
+            // like the HTTP transport.
+            let mut cursor = std::io::Cursor::new(run.body.clone());
+            let declared = cursor.read_u32::<BigEndian>().unwrap() as usize;
+            let mut encoded = vec![0u8; declared];
+            std::io::Read::read_exact(&mut cursor, &mut encoded).unwrap();
+            let parsed: RunJobHttpRequest = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(parsed.outputs, vec!["out.o".to_string()]);
+            let mut unpacked = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(cursor), &mut unpacked)
+                .unwrap();
+            assert_eq!(unpacked, inputs);
+
+            let upload = log
+                .iter()
+                .find(|request| {
+                    request
+                        .path
+                        .starts_with("/api/v1/distserver/submit_toolchain/")
+                })
+                .expect("toolchain upload missing");
+            assert_eq!(upload.target.as_deref(), Some("127.0.0.1:41000"));
+            assert_eq!(upload.authorization.as_deref(), Some("Bearer job-token"));
+            assert_eq!(upload.content_length, Some(archive.len() as u64));
+            assert_eq!(upload.body, archive);
         }
     }
 }

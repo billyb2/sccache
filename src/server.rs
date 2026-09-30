@@ -160,6 +160,7 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
+    quic: bool,
 }
 
 #[cfg(feature = "dist-client")]
@@ -216,6 +217,7 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
+            quic: config.dist.quic,
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -381,6 +383,7 @@ impl DistClientContainer {
                     &config.toolchains,
                     auth_token,
                     config.rewrite_includes_only,
+                    config.quic,
                 );
                 let dist_client =
                     try_or_retry_later!(dist_client.context("failure during dist client creation"));
@@ -1116,6 +1119,7 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
+                    quic: false,
                 }),
                 dist_client,
             ))),

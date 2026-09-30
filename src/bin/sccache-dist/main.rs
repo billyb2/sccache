@@ -4,6 +4,7 @@ extern crate log;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use rand::{RngCore, rngs::OsRng};
+use sccache::bf_timing::BfTimingOpt;
 use sccache::config::{
     INSECURE_DIST_CLIENT_TOKEN, scheduler as scheduler_config, server as server_config,
 };
@@ -1085,12 +1086,23 @@ impl ServerIncoming for Server {
                 _ => unreachable!("Ready was checked under the same lock"),
             }
         };
-        // Locally visible before reporting, but never hide an unsuccessful
-        // Started report or rerun the compiler to retry a state callback.
-        let result = Self::report_job_state_with_retries(requester, job_id, JobState::Started)
+        // Report-state RPCs are distinct from the compile: each traverses the
+        // worker → scheduler route and can dominate a short compilation.
+        let timing_started =
+            sccache::bf_timing::BfTiming::start_with_job("worker_report_started", Some(job_id.0));
+        let started = Self::report_job_state_with_retries(requester, job_id, JobState::Started);
+        timing_started.finish();
+        let result = started
             .and_then(|_| {
-                self.builder
-                    .run_build(tc, command, outputs, inputs_rdr, &self.cache)
+                let timing = sccache::bf_timing::BfTiming::start_with_job(
+                    "worker_run_build",
+                    Some(job_id.0),
+                );
+                let res = self
+                    .builder
+                    .run_build(tc, command, outputs, inputs_rdr, &self.cache);
+                timing.finish();
+                res
             })
             .map(|result| {
                 RunJobResult::Complete(JobComplete {
@@ -1106,7 +1118,10 @@ impl ServerIncoming for Server {
                 .context("Running job disappeared")?;
             entry.job = WorkerJob::Complete;
         }
+        let timing_complete =
+            sccache::bf_timing::BfTiming::start_with_job("worker_report_complete", Some(job_id.0));
         let report = Self::report_job_state_with_retries(requester, job_id, JobState::Complete);
+        timing_complete.finish();
         self.jobs.lock().unwrap().retire(job_id);
         report?;
         result

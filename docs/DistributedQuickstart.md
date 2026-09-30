@@ -146,6 +146,22 @@ $ sccache --dist-status
 {"SchedulerStatus":["https://sccache1.corpdmz.ber3.mozilla.com/",{"num_servers":3,"num_cpus":56,"in_progress":24}]}
 ```
 
+The distributed client reuses HTTP connections and retains up to 32 idle
+connections per host. This bounds retained connections, not concurrent compile
+jobs. The same limit applies after worker certificates are updated.
+
+Billdfaster gateways additionally support `quic = true` in `[dist]`. This
+routes scheduler and worker RPCs over a persistent QUIC connection; the default
+is `false`, which retains the HTTP transport and its connection pool. Public
+QUIC deployments need dedicated IPv4 UDP ingress, with no shared, TCP-only IPv4
+address left in the scheduler hostname's DNS answers.
+
+The client obtains the gateway certificate through authenticated HTTPS
+`GET /v1/quic`, pins that certificate, and still verifies the TLS server name.
+Only read-only scheduler GETs may use resumed 0-RTT. Allocation, toolchain
+submission, and compilation wait for handshake confirmation; mutations are not
+automatically retried and QUIC failure never silently switches to HTTP.
+
 Using custom toolchains
 -----------------------
 

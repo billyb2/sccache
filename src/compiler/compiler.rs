@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "dist-client")]
+use crate::bf_timing::{BfTiming, BfTimingOpt};
 use crate::cache::{Cache, CacheWrite, DecompressionFailure, FileObjectSource, Storage};
 use crate::compiler::args::*;
 use crate::compiler::c::{CCompiler, CCompilerKind};
@@ -594,6 +596,8 @@ where
         cache_control: CacheControl,
         pool: tokio::runtime::Handle,
     ) -> Result<(CompileResult, process::Output)> {
+        #[cfg(feature = "dist-client")]
+        let _timing_request = BfTiming::start("wrapper_request");
         let out_pretty = self.output_pretty().into_owned();
         debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
         let start = Instant::now();
@@ -602,6 +606,8 @@ where
             Some(ref client) => client.rewrite_includes_only(),
             _ => false,
         };
+        #[cfg(feature = "dist-client")]
+        let timing_hash = BfTiming::start("hash_key_generation");
         let result = self
             .generate_hash_key(
                 &creator,
@@ -614,6 +620,8 @@ where
                 cache_control,
             )
             .await;
+        #[cfg(feature = "dist-client")]
+        timing_hash.finish();
         debug!(
             "[{}]: generate_hash_key took {}",
             out_pretty,
@@ -838,6 +846,8 @@ where
                     out_pretty,
                     fmt_duration_as_secs(&duration_compilation)
                 );
+                #[cfg(feature = "dist-client")]
+                let timing_artifact = BfTiming::start("cache_artifact_pack");
                 let start_create_artifact = Instant::now();
                 let mut entry = CacheWrite::from_objects(outputs, &pool)
                     .await
@@ -845,6 +855,8 @@ where
 
                 entry.put_stdout(&compiler_result.stdout)?;
                 entry.put_stderr(&compiler_result.stderr)?;
+                #[cfg(feature = "dist-client")]
+                timing_artifact.finish();
                 debug!(
                     "[{}]: Created cache artifact in {}",
                     out_pretty,
@@ -855,8 +867,13 @@ where
                 // Try to finish storing the newly-written cache
                 // entry. We'll get the result back elsewhere.
                 let future = async move {
+                    #[cfg(feature = "dist-client")]
+                    let timing_store = BfTiming::start("cache_store");
                     let start = Instant::now();
-                    match storage.put(&key, entry).await {
+                    let stored = storage.put(&key, entry).await;
+                    #[cfg(feature = "dist-client")]
+                    timing_store.finish();
+                    match stored {
                         Ok(_) => {
                             debug!("[{}]: Stored in cache successfully!", out_pretty2);
                             Ok(CacheWriteInfo {
@@ -941,10 +958,13 @@ where
         Some(dc) => dc,
         None => {
             debug!("[{}]: Compiling locally", out_pretty);
-            return compile_cmd
+            let timing_local = BfTiming::start("local_compile");
+            let res = compile_cmd
                 .execute(service, &creator)
                 .await
                 .map(move |o| (cacheable, DistType::NoDist, o));
+            timing_local.finish();
+            return res;
         }
     };
 
@@ -960,7 +980,9 @@ where
                 "[{}]: Inputs cannot be distributed on this platform, compiling locally",
                 out_pretty
             );
+            let timing_local = BfTiming::start("local_compile");
             let output = compile_cmd.execute(service, &creator).await?;
+            timing_local.finish();
             return Ok((cacheable, DistType::NoDist, output));
         }
         return Err(e);
@@ -988,9 +1010,11 @@ where
             "[{}]: Identifying dist toolchain for {:?}",
             out_pretty, local_executable
         );
+        let timing_tc = BfTiming::start("put_toolchain");
         let (dist_toolchain, maybe_dist_compile_executable) = dist_client
             .put_toolchain(local_executable, weak_toolchain_key, toolchain_packager)
             .await?;
+        timing_tc.finish();
         let mut tc_archive = None;
         if let Some((dist_compile_executable, archive_path)) = maybe_dist_compile_executable {
             dist_compile_cmd.executable = dist_compile_executable;
@@ -998,6 +1022,7 @@ where
         }
 
         debug!("[{}]: Requesting allocation", out_pretty);
+        let timing_alloc = BfTiming::start("alloc_job_orchestration");
         let jares = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
         let job_alloc = match jares {
             dist::AllocJobResult::Success {
@@ -1032,9 +1057,11 @@ where
                 Err(anyhow!("Failed to allocate job").context(msg))
             }
         }?;
+        timing_alloc.finish();
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
         debug!("[{}]: Running job", out_pretty);
+        let timing_run = BfTiming::start_with_job("run_job_orchestration", Some(job_id.0));
         let ((job_id, server_id), (jres, path_transformer)) = dist_client
             .do_run_job(
                 job_alloc,
@@ -1050,6 +1077,7 @@ where
                     server_id
                 )
             })?;
+        timing_run.finish();
 
         let mut jc = match jres {
             dist::RunJobResult::Complete(jc) => jc,
@@ -1062,7 +1090,10 @@ where
                 .map(|(p, bs)| (p, bs.lens().to_string()))
                 .collect::<Vec<_>>()
         );
+        let job_id_num = job_id.0;
         let mut output_paths: Vec<PathBuf> = vec![];
+        let mut timing_out = BfTiming::start_with_job("output_decode", Some(job_id_num));
+        let mut output_bytes_out: u64 = 0;
         macro_rules! try_or_cleanup {
             ($v:expr) => {{
                 match $v {
@@ -1084,7 +1115,11 @@ where
         }
 
         for (path, output_data) in jc.outputs {
-            let len = output_data.lens().actual;
+            let lens = output_data.lens();
+            let len = lens.actual;
+            if timing_out.is_some() {
+                output_bytes_out += lens.compressed;
+            }
             let local_path = try_or_cleanup!(
                 path_transformer
                     .to_local(&path)
@@ -1110,11 +1145,15 @@ where
             Some(p) => vec![p],
             None => vec![],
         };
+        timing_out.set_bytes_out(output_bytes_out);
+        timing_out.finish();
+        let timing_rewrite = BfTiming::start_with_job("outputs_rewrite", Some(job_id_num));
         try_or_cleanup!(
             outputs_rewriter
                 .handle_outputs(&path_transformer, &output_paths, &extra_inputs)
                 .with_context(|| "failed to rewrite outputs from compile")
         );
+        timing_rewrite.finish();
 
         if jc.output.code != 0 {
             // Add server info to help diagnose host-specific failures, e.g. due to flaky hardware.
@@ -1149,10 +1188,13 @@ where
                     out_pretty2, errmsg
                 );
 
-                compile_cmd
+                let timing_local = BfTiming::start("local_compile_fallback");
+                let res = compile_cmd
                     .execute(service, &creator)
                     .await
-                    .map(|o| (DistType::Error, o))
+                    .map(|o| (DistType::Error, o));
+                timing_local.finish();
+                res
             }
         })
         .map_ok(move |(dt, o)| (cacheable, dt, o))

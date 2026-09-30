@@ -16,6 +16,7 @@ use anyhow::{Context, Error, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use fs_err as fs;
 use libmount::Overlay;
+use sccache::bf_timing::BfTimingOpt;
 use sccache::dist::{
     BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
     Toolchain,
@@ -332,9 +333,11 @@ impl OverlayBuilder {
                     trace!("copying in inputs");
                     // Note that we don't unpack directly into the upperdir since there overlayfs has some
                     // special marker files that we don't want to create by accident (or malicious intent)
+                    let timing_unpack = sccache::bf_timing::BfTiming::start("worker_input_unpack");
                     tar::Archive::new(inputs_rdr)
                         .unpack(&target_dir)
                         .context("Failed to unpack inputs to overlay")?;
+                    timing_unpack.finish();
 
                     let CompileCommand {
                         executable,
@@ -359,6 +362,7 @@ impl OverlayBuilder {
                     }
 
                     trace!("performing compile");
+                    let timing_compile = sccache::bf_timing::BfTiming::start("worker_compile");
                     // Bubblewrap notes:
                     // - We're running as uid 0 (to do the mounts above), and so bubblewrap is run as uid 0
                     // - There's special handling in bubblewrap to compare uid and euid - of interest to us,
@@ -404,10 +408,13 @@ impl OverlayBuilder {
                     let compile_output = cmd
                         .output()
                         .context("Failed to retrieve output from compile")?;
+                    timing_compile.finish();
                     trace!("compile_output: {:?}", compile_output);
 
                     let mut outputs = vec![];
                     trace!("retrieving {:?}", output_paths);
+                    let mut timing_pack =
+                        sccache::bf_timing::BfTiming::start("worker_output_package");
                     for path in output_paths {
                         let abspath = join_suffix(&target_dir, cwd.join(&path)); // Resolve in case it's relative since we copy it from the root level
                         match fs::File::open(abspath) {
@@ -427,6 +434,11 @@ impl OverlayBuilder {
                             }
                         }
                     }
+                    if timing_pack.is_some() {
+                        let output_bytes = outputs.iter().map(|(_, d)| d.lens().compressed).sum();
+                        timing_pack.set_bytes_out(output_bytes);
+                    }
+                    timing_pack.finish();
                     let compile_output = ProcessOutput::try_from(compile_output)
                         .context("Failed to convert compilation exit status")?;
                     Ok(BuildResult {
@@ -787,6 +799,7 @@ impl DockerBuilder {
         );
 
         trace!("copying in inputs");
+        let timing_unpack = sccache::bf_timing::BfTiming::start("worker_input_unpack");
         Command::new("docker")
             .args(["cp", "-", &format!("{}:/", cid)])
             .check_piped(&mut |stdin| {
@@ -794,6 +807,7 @@ impl DockerBuilder {
                 Ok(())
             })
             .context("Failed to copy inputs tar into container")?;
+        timing_unpack.finish();
         drop(inputs_rdr);
 
         let CompileCommand {
@@ -822,6 +836,7 @@ impl DockerBuilder {
 
         trace!("performing compile");
         // TODO: likely shouldn't perform the compile as root in the container
+        let timing_compile = sccache::bf_timing::BfTiming::start("worker_compile");
         let mut cmd = Command::new("docker");
         cmd.arg("exec");
         for (k, v) in env_vars {
@@ -841,10 +856,12 @@ impl DockerBuilder {
         cmd.arg(executable);
         cmd.args(arguments);
         let compile_output = cmd.output().context("Failed to start executing compile")?;
+        timing_compile.finish();
         trace!("compile_output: {:?}", compile_output);
 
         let mut outputs = vec![];
         trace!("retrieving {:?}", output_paths);
+        let mut timing_pack = sccache::bf_timing::BfTiming::start("worker_output_package");
         for path in output_paths {
             let abspath = cwd.join(&path); // Resolve in case it's relative since we copy it from the root level
             // TODO: this isn't great, but cp gives it out as a tar
@@ -861,6 +878,11 @@ impl DockerBuilder {
                 debug!("Missing output path {:?}", path)
             }
         }
+        if timing_pack.is_some() {
+            let output_bytes = outputs.iter().map(|(_, d)| d.lens().compressed).sum();
+            timing_pack.set_bytes_out(output_bytes);
+        }
+        timing_pack.finish();
 
         let compile_output = ProcessOutput::try_from(compile_output)
             .context("Failed to convert compilation exit status")?;
