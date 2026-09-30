@@ -230,6 +230,12 @@ pub mod urls {
             .join("/api/v1/scheduler/status")
             .expect("failed to create alloc job url")
     }
+    /// Scheduler route for build-lease mutations.
+    pub fn scheduler_build_lease(scheduler_url: &reqwest::Url) -> reqwest::Url {
+        scheduler_url
+            .join("/api/v1/scheduler/build_lease")
+            .expect("failed to create build lease url")
+    }
 
     pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
         let url = format!(
@@ -1113,6 +1119,7 @@ mod client {
     use super::super::quic;
     use crate::bf_timing::{BfTiming, BfTimingOpt};
     use crate::config;
+    use crate::dist::lease;
     use crate::dist::pkg::{InputsPackager, ToolchainPackager};
     use crate::dist::{
         self, AllocJobResult, CompileCommand, JobAlloc, PathTransformer, RunJobResult,
@@ -1178,6 +1185,13 @@ mod client {
                 .timeout(timeout)
                 .connect_timeout(connect_timeout)
                 .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
+                // Distributed RPCs, and lease mutations in particular, must
+                // reach the scheduler this client was configured for: a
+                // redirect would replay the body somewhere else, and an
+                // automatic retry would replay a mutation the caller never
+                // repeated.
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .build()
                 .context("failed to create an async HTTP client")?;
             let client_toolchains =
@@ -1230,6 +1244,10 @@ mod client {
                 .timeout(timeout)
                 .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
                 .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
+                // Same transport rules as the original client: no redirects
+                // and no automatic retries for any distributed RPC.
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .build()
                 .context("failed to create an async HTTP client")?;
             // Use the updated certificates
@@ -1328,6 +1346,90 @@ mod client {
         pub(crate) fn set_quic_descriptor(&self, descriptor: quic::Descriptor) {
             if let Some(quic) = &self.quic {
                 quic.set_descriptor(descriptor);
+            }
+        }
+
+        /// POST /api/v1/scheduler/build_lease over the selected transport.
+        ///
+        /// This is a mutation: it is sent once, with its own short deadline
+        /// (independent of the 1200s compile RPC timeout), it is never
+        /// replayed, and nothing falls back to HTTP after a QUIC failure. The
+        /// response is validated by [`lease::decode_build_lease_response`] on
+        /// both transports, so a status or body mismatch is always explicit.
+        async fn build_lease_request(
+            &self,
+            operation: lease::BuildLeaseOperation,
+            lease_id: &str,
+        ) -> std::result::Result<lease::BuildLeaseOutcome, lease::BuildLeaseFailure> {
+            let body = serde_json::to_vec(&lease::BuildLeaseRequest {
+                operation: operation.as_str(),
+                lease_id,
+            })
+            .map_err(|error| {
+                lease::BuildLeaseFailure::ambiguous(
+                    anyhow!(error).context("failed to encode the build lease request"),
+                )
+            })?;
+            let deadline = lease::RPC_DEADLINE;
+            let call = async {
+                match &self.quic {
+                    Some(quic) => {
+                        let request = quic::Request {
+                            target: None,
+                            method: quic::Method::Post,
+                            path: Self::request_path(&urls::scheduler_build_lease(
+                                &self.scheduler_url,
+                            )),
+                            authorization: Some(format!("Bearer {}", self.auth_token)),
+                            body: quic::Body::Bytes(body),
+                        };
+                        let response = quic.request(request).await.map_err(|error| {
+                            lease::BuildLeaseFailure::ambiguous(
+                                error.context("build lease request failed"),
+                            )
+                        })?;
+                        lease::decode_build_lease_response(
+                            operation,
+                            lease_id,
+                            response.status,
+                            &response.body,
+                        )
+                    }
+                    None => {
+                        let url = urls::scheduler_build_lease(&self.scheduler_url);
+                        let request = self
+                            .client
+                            .lock()
+                            .unwrap()
+                            .post(url)
+                            .bearer_auth(self.auth_token.clone())
+                            .timeout(deadline)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .header(reqwest::header::CONTENT_LENGTH, body.len())
+                            .body(body);
+                        let response = request.send().await.map_err(|error| {
+                            lease::BuildLeaseFailure::ambiguous(
+                                anyhow!(error).context("build lease request failed"),
+                            )
+                        })?;
+                        let status = response.status().as_u16();
+                        let bytes = response.bytes().await.map_err(|error| {
+                            lease::BuildLeaseFailure::ambiguous(
+                                anyhow!(error).context("failed to read the build lease response"),
+                            )
+                        })?;
+                        lease::decode_build_lease_response(operation, lease_id, status, &bytes)
+                    }
+                }
+            };
+            // The QUIC transport applies the compile RPC deadline internally;
+            // a lease mutation must never wait that long.
+            match tokio::time::timeout(deadline, call).await {
+                Ok(result) => result,
+                Err(_) => Err(lease::BuildLeaseFailure::ambiguous(anyhow!(
+                    "build lease request timed out after {:?}",
+                    deadline
+                ))),
             }
         }
     }
@@ -1604,6 +1706,21 @@ mod client {
                 _ => None,
             }
         }
+
+        async fn do_build_lease(
+            &self,
+            operation: lease::BuildLeaseOperation,
+            lease_id: &str,
+        ) -> std::result::Result<lease::BuildLeaseOutcome, lease::BuildLeaseFailure> {
+            // Only capabilities minted here are ever sent, and only in the
+            // exact shape the gateway accepts.
+            if !lease::is_valid_lease_id(lease_id) {
+                return Err(lease::BuildLeaseFailure::ambiguous(anyhow!(
+                    "refusing to send a malformed build lease id"
+                )));
+            }
+            self.build_lease_request(operation, lease_id).await
+        }
     }
 
     #[cfg(all(test, feature = "dist-server"))]
@@ -1616,7 +1733,7 @@ mod client {
 
         struct HttpFixture {
             url: reqwest::Url,
-            requests: Arc<Mutex<Vec<(SocketAddr, usize)>>>,
+            requests: Arc<Mutex<Vec<(SocketAddr, usize, String, Vec<u8>)>>>,
             stop: Sender<()>,
             thread: Option<JoinHandle<()>>,
         }
@@ -1628,9 +1745,31 @@ mod client {
                 let handler = move |request: &rouille::Request| {
                     let mut body = Vec::new();
                     std::io::Read::read_to_end(&mut request.data().unwrap(), &mut body).unwrap();
-                    seen.lock()
-                        .unwrap()
-                        .push((*request.remote_addr(), body.len()));
+                    seen.lock().unwrap().push((
+                        *request.remote_addr(),
+                        body.len(),
+                        request.url(),
+                        body.clone(),
+                    ));
+                    if request.url() == "/api/v1/scheduler/build_lease" {
+                        // The lease route speaks strict JSON, not bincode.
+                        let parsed: serde_json::Value =
+                            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                        let lease_id = parsed
+                            .get("lease_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        let response = serde_json::json!({
+                            "lease_id": lease_id,
+                            "ttl_seconds": 90,
+                        });
+                        return rouille::Response::from_data(
+                            "application/json",
+                            serde_json::to_vec(&response).unwrap(),
+                        )
+                        .with_status_code(200)
+                        .with_unique_header("Content-Type", "application/json");
+                    }
                     super::super::server::bincode_response(&SchedulerStatusResult {
                         num_servers: 1,
                         num_cpus: 8,
@@ -2004,6 +2143,227 @@ mod client {
             assert_eq!(upload.authorization.as_deref(), Some("Bearer job-token"));
             assert_eq!(upload.content_length, Some(archive.len() as u64));
             assert_eq!(upload.body, archive);
+        }
+
+        /// Build-lease mutations travel the pinned HTTP transport as strict
+        /// JSON on the scheduler route, and their statuses are validated
+        /// exactly.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn http_transport_carries_build_leases() {
+            use crate::dist::lease::{self, BuildLeaseOperation, BuildLeaseOutcome};
+
+            let fixture = HttpFixture::new(None);
+            let directory = tempfile::tempdir().unwrap();
+            let client = Client::new(
+                &tokio::runtime::Handle::current(),
+                fixture.url.clone(),
+                directory.path(),
+                1024 * 1024,
+                &[],
+                "scheduler-token".into(),
+                false,
+                false,
+            )
+            .unwrap();
+
+            let lease_id = lease::new_lease_id();
+            let outcome = client
+                .do_build_lease(BuildLeaseOperation::Acquire, &lease_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                BuildLeaseOutcome::Held {
+                    lease_id: lease_id.clone(),
+                    ttl_seconds: 90,
+                }
+            );
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].2, "/api/v1/scheduler/build_lease");
+            assert_eq!(
+                requests[0].3,
+                format!(r#"{{"operation":"acquire","lease_id":"{lease_id}"}}"#).into_bytes(),
+                "the lease request must carry only the operation and the capability"
+            );
+            drop(requests);
+
+            // A malformed capability never reaches the wire.
+            assert!(
+                client
+                    .do_build_lease(BuildLeaseOperation::Renew, "not-a-lease-id")
+                    .await
+                    .unwrap_err()
+                    .is_ambiguous()
+            );
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// Lease transport coverage that needs no HTTP server: the QUIC path is
+    /// exercised against the loopback fixture under `dist-client` alone.
+    #[cfg(test)]
+    mod lease_tests {
+        use super::*;
+        use crate::dist::Client as _;
+        use crate::dist::lease::{self, BuildLeaseOperation, BuildLeaseOutcome};
+        use crate::dist::quic::test_fixture::{Fixture, RecordedRequest, Responder};
+
+        async fn client_for(responder: Responder) -> (Client, Fixture) {
+            let fixture = Fixture::start_with(Some(responder)).await;
+            let directory = tempfile::tempdir().unwrap();
+            let client = Client::new(
+                &tokio::runtime::Handle::current(),
+                reqwest::Url::parse("https://localhost").unwrap(),
+                directory.path(),
+                1024 * 1024,
+                &[],
+                "scheduler-token".into(),
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(client.quic.is_some(), "QUIC transport was not selected");
+            client.set_quic_descriptor(fixture.descriptor());
+            (client, fixture)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn quic_carries_build_leases_as_scheduler_json() {
+            let responder: Responder = Arc::new(|request: &RecordedRequest| {
+                if request.path == "/api/v1/scheduler/build_lease" {
+                    let parsed: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    let lease_id = parsed
+                        .get("lease_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap()
+                        .to_owned();
+                    let body = serde_json::json!({ "lease_id": lease_id, "ttl_seconds": 90 });
+                    (200, serde_json::to_vec(&body).unwrap())
+                } else {
+                    (404, b"unexpected path".to_vec())
+                }
+            });
+            let (client, fixture) = client_for(responder).await;
+            let lease_id = lease::new_lease_id();
+            let outcome = client
+                .do_build_lease(BuildLeaseOperation::Acquire, &lease_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                BuildLeaseOutcome::Held {
+                    lease_id: lease_id.clone(),
+                    ttl_seconds: 90,
+                }
+            );
+            let log = fixture.request_log();
+            assert_eq!(log.len(), 1, "unexpected requests: {log:?}");
+            let request = &log[0];
+            assert_eq!(request.path, "/api/v1/scheduler/build_lease");
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, None, "lease requests are scheduler-only");
+            assert_eq!(request.client_token, "scheduler-token");
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer scheduler-token")
+            );
+            assert_eq!(
+                request.body,
+                format!(r#"{{"operation":"acquire","lease_id":"{lease_id}"}}"#).into_bytes()
+            );
+            assert_eq!(request.content_length, Some(request.body.len() as u64));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn lease_statuses_are_explicit_and_never_replayed() {
+            let status = Arc::new(std::sync::atomic::AtomicU16::new(404));
+            let body = Arc::new(Mutex::new(b"unknown or expired lease".to_vec()));
+            let responder: Responder = {
+                let status = Arc::clone(&status);
+                let body = Arc::clone(&body);
+                Arc::new(move |_request: &RecordedRequest| {
+                    (
+                        status.load(std::sync::atomic::Ordering::SeqCst),
+                        body.lock().unwrap().clone(),
+                    )
+                })
+            };
+            let (client, fixture) = client_for(responder).await;
+            let lease_id = lease::new_lease_id();
+
+            // A definitive 404 on renew retires the lease, and is sent once.
+            let failure = client
+                .do_build_lease(BuildLeaseOperation::Renew, &lease_id)
+                .await
+                .unwrap_err();
+            assert!(failure.is_unknown_lease(), "{failure}");
+            assert_eq!(fixture.request_log().len(), 1, "the mutation was replayed");
+
+            // 409 marks a duplicate acquire.
+            status.store(409, std::sync::atomic::Ordering::SeqCst);
+            let failure = client
+                .do_build_lease(BuildLeaseOperation::Acquire, &lease_id)
+                .await
+                .unwrap_err();
+            assert!(failure.is_duplicate(), "{failure}");
+
+            // 503 stays a definitive gateway failure.
+            status.store(503, std::sync::atomic::Ordering::SeqCst);
+            let failure = client
+                .do_build_lease(BuildLeaseOperation::Renew, &lease_id)
+                .await
+                .unwrap_err();
+            assert_eq!(failure.status, Some(503));
+            assert!(!failure.is_ambiguous());
+
+            // A 200 with an undecodable body is ambiguous, not a success.
+            status.store(200, std::sync::atomic::Ordering::SeqCst);
+            *body.lock().unwrap() = b"not json".to_vec();
+            let failure = client
+                .do_build_lease(BuildLeaseOperation::Renew, &lease_id)
+                .await
+                .unwrap_err();
+            assert!(failure.is_ambiguous(), "{failure}");
+
+            // A 200 that echoes a different capability is never accepted.
+            *body.lock().unwrap() = serde_json::to_vec(&serde_json::json!({
+                "lease_id": "b".repeat(64),
+                "ttl_seconds": 90,
+            }))
+            .unwrap();
+            let failure = client
+                .do_build_lease(BuildLeaseOperation::Renew, &lease_id)
+                .await
+                .unwrap_err();
+            assert!(failure.is_ambiguous(), "{failure}");
+
+            // Release answers carry only the released flag.
+            *body.lock().unwrap() = br#"{"released":false}"#.to_vec();
+            assert_eq!(
+                client
+                    .do_build_lease(BuildLeaseOperation::Release, &lease_id)
+                    .await
+                    .unwrap(),
+                BuildLeaseOutcome::Released { released: false }
+            );
+
+            // Every call above was sent exactly once.
+            assert_eq!(fixture.request_log().len(), 6);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_malformed_lease_id_never_reaches_the_wire() {
+            let responder: Responder = Arc::new(|_request: &RecordedRequest| (200, b"{}".to_vec()));
+            let (client, fixture) = client_for(responder).await;
+            for bad in ["", "zz", &"A".repeat(64), &"a".repeat(63)] {
+                let failure = client
+                    .do_build_lease(BuildLeaseOperation::Acquire, bad)
+                    .await
+                    .unwrap_err();
+                assert!(failure.is_ambiguous(), "{failure}");
+            }
+            assert!(fixture.request_log().is_empty());
         }
     }
 }

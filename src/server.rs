@@ -149,6 +149,7 @@ pub struct DistClientContainer {
 }
 
 #[cfg(feature = "dist-client")]
+#[derive(Clone)]
 pub struct DistClientConfig {
     // Reusable items tied to an SccacheServer instance
     pool: tokio::runtime::Handle,
@@ -288,7 +289,7 @@ impl DistClientContainer {
         }
     }
 
-    async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
+    pub(crate) async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         Self::maybe_recreate_state(state).await;
@@ -313,17 +314,18 @@ impl DistClientContainer {
     }
 
     async fn maybe_recreate_state(state: &mut DistClientState) {
-        if let DistClientState::RetryCreateAt(_, instant) = *state {
-            if instant > Instant::now() {
-                return;
+        let config = match state {
+            DistClientState::RetryCreateAt(config, instant) if *instant <= Instant::now() => {
+                (**config).clone()
             }
-            let config = match mem::replace(state, DistClientState::Disabled) {
-                DistClientState::RetryCreateAt(config, _) => config,
-                _ => unreachable!(),
-            };
-            info!("Attempting to recreate the dist client");
-            *state = Self::create_state(*config).await;
-        }
+            _ => return,
+        };
+        info!("Attempting to recreate the dist client");
+        // The previous state stays in place until the new one is committed, so
+        // a cancelled recreation (a lease RPC deadline, a dropped compile) can
+        // never strand the container in `Disabled` and lose the configuration:
+        // the next attempt simply retries with the same config.
+        *state = Self::create_state(config).await;
     }
 
     // Attempt to recreate the dist client
@@ -427,6 +429,21 @@ thread_local! {
     /// information via a panic hook to be used when catch_unwind
     /// catches a panic.
     static PANIC_LOCATION: Cell<Option<(String, u32, u32)>> = const { Cell::new(None) };
+}
+/// Create the per-daemon build-lease keeper.
+///
+/// With the distributed client compiled in, leases travel over the daemon's
+/// selected transport; without it there is no gateway to talk to, so the
+/// keeper is a no-op.
+fn build_lease_keeper(
+    dist_client: &Arc<DistClientContainer>,
+    rt: &tokio::runtime::Handle,
+) -> Arc<crate::dist::lease::BuildLeaseKeeper> {
+    #[cfg(feature = "dist-client")]
+    let keeper = crate::dist::lease::BuildLeaseKeeper::new(dist_client.clone(), rt);
+    #[cfg(not(feature = "dist-client"))]
+    let keeper = crate::dist::lease::BuildLeaseKeeper::disabled();
+    keeper
 }
 
 #[cfg(unix)]
@@ -737,6 +754,11 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             wait,
         } = self;
 
+        // Keep a handle on the lease keeper: the service moves into the
+        // connection loop below, but the shutdown path still has to stop its
+        // renewal tasks and release what it can.
+        let lease_keeper = Arc::clone(&service.lease_keeper);
+
         // Create our "server future" which will simply handle all incoming
         // connections in separate tasks.
         let server = async move {
@@ -779,6 +801,8 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
                     None
                 },
                 timeout_dur: timeout,
+                #[cfg(feature = "dist-client")]
+                lease_keeper: Arc::clone(&lease_keeper),
             }
             .await;
             info!("shutting down due to being idle or request");
@@ -807,6 +831,12 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         // Note that we cap the amount of time this can take, however, as we
         // don't want to wait *too* long.
         runtime.block_on(async { time::timeout(SHUTDOWN_TIMEOUT, wait).await })?;
+
+        // Best effort, bounded: stop every renewal task and release the
+        // leases of builds that are no longer running. A lease this cannot
+        // release simply expires on the gateway's TTL.
+        const LEASE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
+        runtime.block_on(lease_keeper.shutdown(LEASE_SHUTDOWN_BUDGET));
 
         info!("ok, fully shutting down now");
 
@@ -852,6 +882,9 @@ where
 
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
+
+    /// Renewable build leases, one per live local build owner.
+    lease_keeper: Arc<crate::dist::lease::BuildLeaseKeeper>,
 
     /// Cache storage.
     storage: Arc<dyn Storage>,
@@ -1063,9 +1096,12 @@ where
         tx: mpsc::Sender<ServerMessage>,
         info: ActiveInfo,
     ) -> SccacheService<C> {
+        let dist_client = Arc::new(dist_client);
+        let lease_keeper = build_lease_keeper(&dist_client, &rt);
         SccacheService {
             stats: Arc::default(),
-            dist_client: Arc::new(dist_client),
+            dist_client,
+            lease_keeper,
             storage,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
@@ -1083,10 +1119,12 @@ where
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
-        let dist_client = DistClientContainer::new_disabled();
+        let dist_client = Arc::new(DistClientContainer::new_disabled());
+        let lease_keeper = build_lease_keeper(&dist_client, &rt);
         SccacheService {
             stats: Arc::default(),
-            dist_client: Arc::new(dist_client),
+            dist_client,
+            lease_keeper,
             storage,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
@@ -1106,23 +1144,26 @@ where
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
+        let dist_client = Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
+            Box::new(DistClientConfig {
+                pool: rt.clone(),
+                scheduler_url: None,
+                auth: config::DistAuth::Token {
+                    token: String::new(),
+                },
+                cache_dir: "".into(),
+                toolchain_cache_size: 0,
+                toolchains: vec![],
+                rewrite_includes_only: false,
+                quic: false,
+            }),
+            dist_client,
+        )));
+        let lease_keeper = build_lease_keeper(&dist_client, &rt);
         SccacheService {
             stats: Arc::default(),
-            dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
-                Box::new(DistClientConfig {
-                    pool: rt.clone(),
-                    scheduler_url: None,
-                    auth: config::DistAuth::Token {
-                        token: String::new(),
-                    },
-                    cache_dir: "".into(),
-                    toolchain_cache_size: 0,
-                    toolchains: vec![],
-                    rewrite_includes_only: false,
-                    quic: false,
-                }),
-                dist_client,
-            ))),
+            dist_client,
+            lease_keeper,
             storage,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
@@ -1248,7 +1289,16 @@ where
         let cmd = compile.args;
         let cwd: PathBuf = compile.cwd.into();
         let env_vars = compile.env_vars;
+        let owner = compile.owner;
         let me = self.clone();
+
+        // A real local build owner keeps a gateway lease for the whole build.
+        // This runs before any remote allocation, and later requests for the
+        // same owner are cheap no-ops, so local-only and link steps in the
+        // middle of a build keep the lease alive.
+        if let Some(owner) = owner {
+            self.lease_keeper.ensure(&owner).await;
+        }
 
         let info = self
             .compiler_info(exe.into(), cwd.clone(), &cmd, &env_vars)
@@ -2460,6 +2510,8 @@ struct ShutdownOrInactive {
     rx: mpsc::Receiver<ServerMessage>,
     timeout: Option<Pin<Box<Sleep>>>,
     timeout_dur: Duration,
+    #[cfg(feature = "dist-client")]
+    lease_keeper: Arc<crate::dist::lease::BuildLeaseKeeper>,
 }
 
 impl Future for ShutdownOrInactive {
@@ -2480,10 +2532,23 @@ impl Future for ShutdownOrInactive {
                 Poll::Ready(None) => return Poll::Ready(()),
             }
         }
-        match self.timeout {
-            None => Poll::Pending,
-            Some(ref mut timeout) => timeout.as_mut().poll(cx),
+        let elapsed = match &mut self.timeout {
+            None => return Poll::Pending,
+            Some(timeout) => timeout.as_mut().poll(cx).is_ready(),
+        };
+        if !elapsed {
+            return Poll::Pending;
         }
+        #[cfg(feature = "dist-client")]
+        if self.lease_keeper.retains_builds() {
+            self.timeout = Some(Box::pin(sleep(Duration::from_secs(2))));
+            if let Some(timeout) = &mut self.timeout {
+                // Register this task for the next expiry before yielding.
+                let _ = timeout.as_mut().poll(cx);
+            }
+            return Poll::Pending;
+        }
+        Poll::Ready(())
     }
 }
 

@@ -289,3 +289,47 @@ fn test_map_contains_wrong_value() {
     m.insert("b", 3);
     assert_map_contains!(m, ("a", 1), ("b", 2));
 }
+
+/// Spawn a real long-lived `sleep` process for process-identity tests.
+pub fn spawn_sleep_process() -> std::process::Child {
+    let spawn = |program: &str| {
+        std::process::Command::new(program)
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    spawn("/bin/sleep")
+        .or_else(|_| spawn("sleep"))
+        .expect("failed to spawn sleep")
+}
+
+/// Kill and reap a process spawned by [`spawn_sleep_process`].
+pub fn kill_process(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The kernel-reported build owner of a live child process.
+pub fn owner_of_child(child: &std::process::Child) -> crate::build_owner::BuildOwner {
+    let identity = crate::build_owner::read_process_identity(child.id())
+        .expect("the child must have a kernel identity");
+    crate::build_owner::BuildOwner {
+        pid: identity.pid,
+        start_token: identity.start_token,
+        uid: identity.uid,
+    }
+}
+
+/// Poll `predicate` until it holds or `timeout` elapses.
+pub fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if predicate() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    predicate()
+}

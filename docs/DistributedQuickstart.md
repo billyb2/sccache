@@ -270,3 +270,39 @@ like:
 # systemctl status # And check it's fine.
 # systemctl enable sccache-server # This enables the service on boot
 ```
+
+## Build leases
+
+With the billdfaster gateway, the `sccache` daemon acquires a *build lease* for
+a recognized local build owner. An admitted lease keeps an existing worker
+cohort alive across local-only compilation, linking and build-script gaps;
+acquisition itself never starts workers or reserves a compile slot.
+
+- The compile client names the owning build process: it walks its own ancestry
+  (bounded, same user only) and picks the outermost recognized build driver
+  (`cargo`, `make`/`gmake`/`gnumake`, `ninja`, `cmake`, `meson`). A compiler
+  invoked by hand has no such ancestor and claims nothing. Only the owning
+  process id, its kernel start token and its uid travel to the local daemon.
+  Parent command lines, executable paths and environments are not collected or
+  sent as build-owner metadata; ordinary distributed compiler inputs are
+  unchanged.
+- The daemon re-checks that identity against the kernel, keeps at most one
+  lease per owner, and renews it every 20 seconds (`POST
+  /api/v1/scheduler/build_lease` over the same transport the daemon uses for
+  compiles). Leases are acquired on the first compiler request of a build,
+  before any remote allocation.
+- The owner's exit is noticed within about two seconds, after which the daemon
+  releases the lease once, best effort. A lease the daemon cannot release (for
+  example after a daemon crash) simply expires on the gateway's 90 second TTL.
+  Ordinary daemon idle shutdown is deferred while a lease is owned; explicit
+  shutdown remains available and attempts bounded release.
+- The lease id is a random 256-bit capability minted by the daemon; it is the
+  only thing sent about a build, and it is never logged.
+
+No additional configuration is needed when using a lease-capable scheduler.
+The gateway health response reports `active_build_leases`; `sccache
+--dist-status` retains its existing worker and job counts. An acquisition
+failure leaves compilation available without claiming retention. Lost or
+ambiguous grants are not automatically reacquired. Each scheduled lease
+heartbeat is sent once, without early data, redirects, transport-level retries
+or silent fallback to another transport.

@@ -107,6 +107,14 @@ pub struct Compile {
     pub args: Vec<OsString>,
     /// The environment variables present when the compiler was executed, as (var, val).
     pub env_vars: Vec<(OsString, OsString)>,
+    /// Optional identity of the local build process this compile belongs to.
+    ///
+    /// The client discovers it from the kernel (see [`crate::build_owner`]);
+    /// the daemon re-checks it against the kernel before it holds a
+    /// distributed build lease for it. `None` means the compile is a
+    /// standalone compiler invocation, which claims no build lease.
+    #[serde(default)]
+    pub owner: Option<crate::build_owner::BuildOwner>,
 }
 
 /// Cache metadata returned by the daemon on `StorageHandshake`.

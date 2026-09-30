@@ -411,6 +411,7 @@ fn request_compile<W, X, Y>(
     args: &[X],
     cwd: Y,
     env_vars: Vec<(OsString, OsString)>,
+    owner: Option<crate::build_owner::BuildOwner>,
 ) -> Result<CompileResponse>
 where
     W: AsRef<Path>,
@@ -422,6 +423,7 @@ where
         cwd: cwd.as_ref().to_owned().into(),
         args: args.iter().map(|a| a.as_ref().to_owned()).collect(),
         env_vars,
+        owner,
     });
     trace!("request_compile: {:?}", req);
     //TODO: better error mapping?
@@ -647,7 +649,12 @@ where
 {
     trace!("do_compile");
     let exe_path = which_in(exe, path, cwd)?;
-    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars)?;
+    // Name the local build this compile belongs to, so the daemon can hold a
+    // lease for as long as that process lives. Standalone compiler calls have
+    // no recognized build ancestor and claim nothing, and a build without the
+    // distributed client never walks the process tree at all.
+    let owner = crate::build_owner::discover_build_owner_for_lease();
+    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars, owner)?;
     handle_compile_response(
         creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, stdout, stderr,
     )
@@ -693,6 +700,11 @@ where
         cwd: cwd.as_os_str().to_owned(),
         args: cmdline.clone(),
         env_vars,
+        // Client-side mode runs the compile here; the owner still travels with
+        // the request so the same field means the same thing on both paths.
+        // Without the distributed client the field stays empty and no ancestry
+        // is walked.
+        owner: crate::build_owner::discover_build_owner_for_lease(),
     };
     let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
     let creator = C::new(jobserver);

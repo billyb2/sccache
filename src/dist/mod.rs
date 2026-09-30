@@ -35,7 +35,34 @@ pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod http;
 #[cfg(feature = "dist-client")]
+pub mod lease;
+#[cfg(feature = "dist-client")]
 pub mod quic;
+/// Build-lease keeper stub for builds without the distributed client: there is
+/// no transport to reach a gateway with, so there is nothing to acquire, renew
+/// or release.
+#[cfg(not(feature = "dist-client"))]
+pub(crate) mod lease {
+    use crate::build_owner::BuildOwner;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    pub struct BuildLeaseKeeper;
+
+    impl BuildLeaseKeeper {
+        pub fn disabled() -> Arc<Self> {
+            Arc::new(Self)
+        }
+
+        pub async fn ensure(&self, _owner: &BuildOwner) {}
+
+        pub async fn active_leases(&self) -> usize {
+            0
+        }
+
+        pub async fn shutdown(&self, _budget: Duration) {}
+    }
+}
 #[cfg(test)]
 mod test;
 
@@ -802,6 +829,22 @@ pub trait Client: Send + Sync {
         weak_key: String,
         toolchain_packager: Box<dyn pkg::ToolchainPackager>,
     ) -> Result<(Toolchain, Option<(String, PathBuf)>)>;
+    /// Send one build-lease mutation to the scheduler gateway.
+    ///
+    /// The lease id is a local capability minted by
+    /// [`lease::new_lease_id`]; nothing else about the build travels. The
+    /// default implementation reports an unsupported transport, which simply
+    /// means no lease is ever held.
+    #[cfg(feature = "dist-client")]
+    async fn do_build_lease(
+        &self,
+        _operation: lease::BuildLeaseOperation,
+        _lease_id: &str,
+    ) -> std::result::Result<lease::BuildLeaseOutcome, lease::BuildLeaseFailure> {
+        Err(lease::BuildLeaseFailure::ambiguous(anyhow!(
+            "the selected distributed transport does not support build leases"
+        )))
+    }
     fn rewrite_includes_only(&self) -> bool;
     fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }
