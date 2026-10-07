@@ -1152,6 +1152,140 @@ mod client {
     // Bound retained sockets while allowing concurrent jobs to reuse them.
     const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 32;
 
+    /// Only live callers share a wave; an acknowledged upload is not a
+    /// permanent assertion that a worker still has this archive.
+    #[derive(Default)]
+    struct UploadWaves {
+        waves: tokio::sync::Mutex<
+            HashMap<(dist::ServerId, Toolchain), std::sync::Weak<tokio::sync::Mutex<bool>>>,
+        >,
+    }
+
+    impl UploadWaves {
+        async fn submit<F, Fut>(
+            &self,
+            worker: dist::ServerId,
+            toolchain: Toolchain,
+            send: F,
+        ) -> Result<SubmitToolchainResult>
+        where
+            F: FnOnce(bool) -> Fut,
+            Fut: Future<Output = Result<SubmitToolchainResult>>,
+        {
+            let mut waves = self.waves.lock().await;
+            waves.retain(|_, wave| wave.strong_count() != 0);
+            let key = (worker, toolchain);
+            let (wave, leader) = match waves.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(wave) => (wave, false),
+                None => {
+                    let wave = Arc::new(tokio::sync::Mutex::new(false));
+                    waves.insert(key, Arc::downgrade(&wave));
+                    (wave, true)
+                }
+            };
+            // Reserve the leader before followers can acquire the wave lock.
+            let leader_guard = if leader { Some(wave.lock().await) } else { None };
+            drop(waves);
+            let mut acknowledged = match leader_guard {
+                Some(guard) => guard,
+                None => wave.lock().await,
+            };
+            if !leader {
+                if !*acknowledged {
+                    bail!("Shared toolchain upload did not receive a successful acknowledgement");
+                }
+                drop(acknowledged);
+                return send(true).await;
+            }
+            let result = send(false).await;
+            *acknowledged = matches!(&result, Ok(SubmitToolchainResult::Success));
+            result
+        }
+    }
+
+    #[cfg(test)]
+    mod upload_wave_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn worker(port: u16) -> dist::ServerId {
+            dist::ServerId::new(([127, 0, 0, 1], port).into())
+        }
+
+        fn toolchain() -> Toolchain {
+            Toolchain { archive_id: "same-archive".into() }
+        }
+
+        #[tokio::test]
+        async fn cold_wave_shares_body_but_acknowledges_every_job_and_not_other_workers() {
+            let waves = UploadWaves::default();
+            let bodies = &AtomicUsize::new(0);
+            let ready = &AtomicUsize::new(0);
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let leader = waves.submit(worker(1), toolchain(), |confirmation| async move {
+                assert!(!confirmation);
+                bodies.fetch_add(1, Ordering::SeqCst);
+                wait.await.unwrap();
+                ready.fetch_add(1, Ordering::SeqCst);
+                Ok(SubmitToolchainResult::Success)
+            });
+            tokio::pin!(leader);
+            assert!(futures::poll!(&mut leader).is_pending());
+            let follower = waves.submit(worker(1), toolchain(), |confirmation| async move {
+                assert!(confirmation);
+                ready.fetch_add(1, Ordering::SeqCst);
+                Ok(SubmitToolchainResult::Success)
+            });
+            tokio::pin!(follower);
+            assert!(futures::poll!(&mut follower).is_pending());
+            waves.submit(worker(2), toolchain(), |confirmation| async move {
+                assert!(!confirmation);
+                Ok(SubmitToolchainResult::Success)
+            }).await.unwrap();
+            release.send(()).unwrap();
+            leader.await.unwrap();
+            follower.await.unwrap();
+            assert_eq!(bodies.load(Ordering::SeqCst), 1);
+            assert_eq!(ready.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn cancelled_leader_does_not_send_or_acknowledge_followers() {
+            let waves = UploadWaves::default();
+            let mut leader = Box::pin(waves.submit(worker(1), toolchain(), |_| async {
+                futures::future::pending::<Result<SubmitToolchainResult>>().await
+            }));
+            assert!(futures::poll!(&mut leader).is_pending());
+            let follower = waves.submit(worker(1), toolchain(), |_| async {
+                panic!("cancelled leader must not authorize a confirmation")
+            });
+            tokio::pin!(follower);
+            assert!(futures::poll!(&mut follower).is_pending());
+            drop(leader);
+            assert!(follower.await.is_err());
+        }
+
+        #[tokio::test]
+        async fn failed_leader_does_not_authorize_confirmation() {
+            let waves = UploadWaves::default();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let leader = waves.submit(worker(1), toolchain(), |_| async {
+                wait.await.unwrap();
+                Ok(SubmitToolchainResult::CannotCache)
+            });
+            tokio::pin!(leader);
+            assert!(futures::poll!(&mut leader).is_pending());
+            let follower = waves.submit(worker(1), toolchain(), |_| async {
+                panic!("failed leader must not authorize a confirmation")
+            });
+            tokio::pin!(follower);
+            assert!(futures::poll!(&mut follower).is_pending());
+            release.send(()).unwrap();
+            assert!(matches!(leader.await.unwrap(), SubmitToolchainResult::CannotCache));
+            assert!(follower.await.is_err());
+        }
+    }
+
     pub struct Client {
         auth_token: String,
         scheduler_url: reqwest::Url,
@@ -1160,6 +1294,7 @@ mod client {
         client: Arc<Mutex<reqwest::Client>>,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
+        uploads: UploadWaves,
         rewrite_includes_only: bool,
         /// Selected once at construction: every asynchronous scheduler and
         /// worker RPC travels over QUIC when this is set, and the pinned HTTP
@@ -1216,6 +1351,7 @@ mod client {
                 client: Arc::new(Mutex::new(client)),
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
+                uploads: UploadWaves::default(),
                 rewrite_includes_only,
                 quic,
             })
@@ -1531,56 +1667,61 @@ mod client {
             job_alloc: JobAlloc,
             tc: Toolchain,
         ) -> Result<SubmitToolchainResult> {
-            match self.tc_cache.get_toolchain(&tc) {
-                Ok(Some(toolchain_file)) => {
+            self.uploads
+                .submit(job_alloc.server_id, tc.clone(), |confirmation| async move {
+                    // Every job sends its own authenticated request. Only a
+                    // successfully acknowledged leader permits an empty body.
+                    let file = if confirmation {
+                        None
+                    } else {
+                        Some(self.tc_cache.get_toolchain(&tc)?
+                            .context("couldn't find toolchain locally")?)
+                    };
                     let timing =
                         BfTiming::start_with_job("do_submit_toolchain", Some(job_alloc.job_id.0));
-                    let res = match &self.quic {
+                    let result = match &self.quic {
                         Some(_) => {
-                            // Stream the cached toolchain archive straight from
-                            // the file; nothing is buffered whole.
-                            let toolchain_file: std::fs::File = toolchain_file.into();
-                            let len = toolchain_file
-                                .metadata()
-                                .context("failed to stat the toolchain file")?
-                                .len();
+                            let body = match file {
+                                Some(file) => {
+                                    let file: std::fs::File = file.into();
+                                    let len = file.metadata()?.len();
+                                    quic::Body::Stream {
+                                        reader: Box::new(tokio::fs::File::from_std(file)),
+                                        len,
+                                    }
+                                }
+                                None => quic::Body::Bytes(Vec::new()),
+                            };
                             let request = quic::Request {
                                 target: Some(job_alloc.server_id.addr()),
                                 method: quic::Method::Post,
                                 path: Self::request_path(&urls::server_submit_toolchain(
-                                    job_alloc.server_id,
-                                    job_alloc.job_id,
+                                    job_alloc.server_id, job_alloc.job_id,
                                 )),
                                 authorization: Some(format!("Bearer {}", job_alloc.auth)),
-                                body: quic::Body::Stream {
-                                    reader: Box::new(tokio::fs::File::from_std(toolchain_file)),
-                                    len,
-                                },
+                                body,
                             };
-                            let (res, _bytes_out) =
-                                self.quic_rpc::<SubmitToolchainResult>(request).await?;
-                            Ok(res)
+                            self.quic_rpc::<SubmitToolchainResult>(request)
+                                .await.map(|(result, _)| result)
                         }
                         None => {
                             let url = urls::server_submit_toolchain(
-                                job_alloc.server_id,
-                                job_alloc.job_id,
+                                job_alloc.server_id, job_alloc.job_id,
                             );
                             let req = self.client.lock().unwrap().post(url);
-                            let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
-                            let toolchain_file_stream =
-                                tokio_util::io::ReaderStream::new(toolchain_file);
-                            let body = Body::wrap_stream(toolchain_file_stream);
-                            let req = req.bearer_auth(job_alloc.auth).body(body);
-                            bincode_req_fut(req).await
+                            let body = match file {
+                                Some(file) => Body::wrap_stream(tokio_util::io::ReaderStream::new(
+                                    tokio::fs::File::from_std(file.into()),
+                                )),
+                                None => Body::from(Vec::new()),
+                            };
+                            bincode_req_fut(req.bearer_auth(job_alloc.auth).body(body)).await
                         }
                     };
                     timing.finish();
-                    res
-                }
-                Ok(None) => Err(anyhow!("couldn't find toolchain locally")),
-                Err(e) => Err(e),
-            }
+                    result
+                })
+                .await
         }
 
         async fn do_run_job(

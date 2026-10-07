@@ -18,6 +18,16 @@ sccache also provides [icecream](https://github.com/icecc/icecream)-style distri
 
 sccache is also available as a [GitHub Actions](https://github.com/marketplace/actions/sccache-action) to facilitate the deployment using GitHub Actions cache.
 
+### billdfaster revision 9 rollout
+
+The daemon reserves its endpoint before initializing remote storage, reports readiness under one startup deadline, owns a private toolchain packaging directory, and stays alive while compiler requests are outstanding. Ordinary compiler RPCs remain blocking after the bounded readiness handshake.
+
+Client revision `0.18.0+billdfaster.9` coalesces concurrent archive uploads to each worker. Every job still authenticates and receives its own acknowledgement. Worker revision `0.18.0+billdfaster.dist.3` stages uploads without holding the global cache lock and verifies the archive digest before atomic publication.
+
+Deploy **all** revision 3 workers before enabling revision 9 clients. An empty cache confirmation from a revision 9 client is unsafe against revision 2 workers after eviction. Drain only after build leases, allocations, relays, and scheduler jobs are idle; preserve maintenance until every worker image is verified. For rollback, restore revision 8 clients before restoring revision 2 workers.
+
+Retire idle older local daemons before switching clients: the readiness request is new. The native billdfaster frontend includes the immutable backend path in automatic daemon namespaces; fixed TCP profiles still require coordinated retirement.
+
 ---
 
 Table of Contents (ToC)

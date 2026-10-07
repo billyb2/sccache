@@ -449,7 +449,7 @@ fn build_lease_keeper(
 #[cfg(unix)]
 fn bind_unix_socket(
     path: &std::path::Path,
-) -> io::Result<(tokio::net::UnixListener, std::fs::File)> {
+) -> io::Result<(tokio::net::UnixListener, UnixSocketOwner)> {
     use std::io::{Read, Seek};
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 
@@ -489,16 +489,140 @@ fn bind_unix_socket(
     }
     let listener = tokio::net::UnixListener::bind(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
-    lock.set_len(0)?;
-    lock.rewind()?;
+    let mut owner = UnixSocketOwner {
+        path: path.to_owned(),
+        identity: (metadata.dev(), metadata.ino()),
+        _lock: lock,
+    };
+    owner._lock.set_len(0)?;
+    owner._lock.rewind()?;
     write!(
-        lock,
+        owner._lock,
         "billdfaster-socket-v1 {} {}\n",
         metadata.dev(),
         metadata.ino()
     )?;
-    lock.sync_all()?;
-    Ok((listener, lock))
+    owner._lock.sync_all()?;
+    Ok((listener, owner))
+}
+
+/// Reservation is held before any remote initialization, but no requests are
+/// accepted until initialization and the startup notification have succeeded.
+enum DaemonListener {
+    Tcp(tokio::net::TcpListener),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener, UnixSocketOwner),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Abstract(tokio::net::UnixListener, Vec<u8>),
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct UnixSocketOwner {
+    path: PathBuf,
+    identity: (u64, u64),
+    _lock: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketOwner {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
+            if (metadata.dev(), metadata.ino()) == self.identity {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+impl DaemonListener {
+    fn bind(addr: &crate::net::SocketAddr, runtime: &Runtime) -> io::Result<Self> {
+        match addr {
+            crate::net::SocketAddr::Net(addr) => {
+                runtime.block_on(tokio::net::TcpListener::bind(addr)).map(Self::Tcp)
+            }
+            #[cfg(unix)]
+            crate::net::SocketAddr::Unix(path) => {
+                let _enter = runtime.enter();
+                let (listener, owner) = bind_unix_socket(path)?;
+                Ok(Self::Unix(listener, owner))
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            crate::net::SocketAddr::UnixAbstract(name) => {
+                let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+                let listener = std::os::unix::net::UnixListener::bind_addr(&addr)?;
+                listener.set_nonblocking(true)?;
+                let _enter = runtime.enter();
+                Ok(Self::Abstract(tokio::net::UnixListener::from_std(listener)?, name.clone()))
+            }
+        }
+    }
+}
+
+impl DaemonListener {
+    /// Keep the failed outcome available for followers still connecting after
+    /// their AddrInUse notice. Stalled peers cannot delay another peer.
+    fn publish_failure(&self, runtime: &Runtime, reason: &str, budget: Duration) -> Result<()> {
+        runtime.block_on(async {
+            match self {
+                Self::Tcp(listener) => serve_startup_failure(listener, reason, sleep(budget)).await,
+                #[cfg(unix)]
+                Self::Unix(listener, _) => serve_startup_failure(listener, reason, sleep(budget)).await,
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Self::Abstract(listener, _) => serve_startup_failure(listener, reason, sleep(budget)).await,
+            }
+        })
+    }
+}
+
+async fn serve_startup_failure<A, F>(listener: &A, reason: &str, shutdown: F) -> Result<()>
+where
+    A: crate::net::Acceptor,
+    A::Socket: 'static,
+    F: Future,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = Arc::new(bincode::serialize(&Request::ServerReady)?);
+    let response = bincode::serialize(&Response::ServerStartup(Err(reason.to_owned())))?;
+    let mut frame = Vec::with_capacity(4 + response.len());
+    frame.extend_from_slice(&(response.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&response);
+    let frame = Arc::new(frame);
+    let mut peers = tokio::task::JoinSet::new();
+    const MAX_STARTUP_PEERS: usize = 128;
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return Ok(()),
+            peer = peers.join_next(), if !peers.is_empty() => {
+                if let Some(Err(error)) = peer {
+                    debug!("startup failure peer task ended: {error}");
+                }
+            }
+            socket = listener.accept(), if peers.len() < MAX_STARTUP_PEERS => {
+                let mut socket = socket?;
+                let frame = Arc::clone(&frame);
+                let request = Arc::clone(&request);
+                peers.spawn(async move {
+                    let mut header = [0; 4];
+                    socket.read_exact(&mut header).await?;
+                    if u32::from_be_bytes(header) != 4 || request.len() != 4 {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    let mut received = [0; 4];
+                    socket.read_exact(&mut received).await?;
+                    if received.as_slice() != request.as_slice() {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    socket.write_all(&frame).await?;
+                    socket.shutdown().await?;
+                    Ok::<_, io::Error>(())
+                });
+            }
+        }
+    }
 }
 
 /// Start an sccache server, listening on `addr`.
@@ -507,6 +631,8 @@ fn bind_unix_socket(
 /// requests a shutdown.
 pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()> {
     info!("start_server: {addr}");
+    let startup_deadline = std::time::Instant::now()
+        + config.server_startup_timeout.unwrap_or(crate::commands::SERVER_STARTUP_TIMEOUT);
     let panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         PANIC_LOCATION.with(|l| {
@@ -523,43 +649,64 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         .worker_threads(std::cmp::max(20, 2 * util::num_cpus()))
         .build()?;
     let pool = runtime.handle().clone();
-    let dist_client = DistClientContainer::new(config, &pool);
-
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
+    let listener = match DaemonListener::bind(addr, &runtime) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let status = if error.kind() == io::ErrorKind::AddrInUse {
+                ServerStartup::AddrInUse
+            } else {
+                let reason = if cfg!(windows) && error.raw_os_error() == Some(10013) {
+                    format!("A Windows port exclusion is blocking use of the configured port.\nTry setting SCCACHE_SERVER_PORT to a new value.\n{error}")
+                } else {
+                    error.to_string()
+                };
+                ServerStartup::Err { reason }
+            };
+            notify_server_startup(notify.as_ref(), status)?;
+            return Err(error.into());
+        }
+    };
+    let dist_client = DistClientContainer::new(config, &pool);
 
     let raw_storage = match storage_from_config(config, &pool) {
         Ok(storage) => storage,
         Err(err) => {
             error!("storage init failed for: {err:?}");
 
-            notify_server_startup(
+            let notified = notify_server_startup(
                 notify.as_ref(),
-                ServerStartup::Err {
-                    reason: err.to_string(),
-                },
-            )?;
-
+                ServerStartup::Err { reason: err.to_string() },
+            );
+            if let Err(error) = listener.publish_failure(
+                &runtime, &err.to_string(),
+                startup_deadline.saturating_duration_since(std::time::Instant::now()),
+            ) {
+                warn!("failed to publish initialization failure to followers: {error}");
+            }
+            notified?;
             return Err(err);
         }
     };
 
-    let cache_mode = runtime.block_on(async {
-        match raw_storage.check().await {
-            Ok(mode) => Ok(mode),
-            Err(err) => {
-                error!("storage check failed for: {err:?}");
-
-                notify_server_startup(
-                    notify.as_ref(),
-                    ServerStartup::Err {
-                        reason: err.to_string(),
-                    },
-                )?;
-
-                Err(err)
+    let cache_mode = match runtime.block_on(raw_storage.check()) {
+        Ok(mode) => mode,
+        Err(err) => {
+            error!("storage check failed for: {err:?}");
+            let notified = notify_server_startup(
+                notify.as_ref(),
+                ServerStartup::Err { reason: err.to_string() },
+            );
+            if let Err(error) = listener.publish_failure(
+                &runtime, &err.to_string(),
+                startup_deadline.saturating_duration_since(std::time::Instant::now()),
+            ) {
+                warn!("failed to publish initialization failure to followers: {error}");
             }
+            notified?;
+            return Err(err);
         }
-    })?;
+    };
     info!("server has setup with {cache_mode:?}");
 
     let storage = match cache_mode {
@@ -567,86 +714,50 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         _ => raw_storage,
     };
 
-    let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
-        match addr {
-            crate::net::SocketAddr::Net(addr) => {
-                trace!("binding TCP {addr}");
-                let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                Ok((
-                    srv.local_addr().unwrap(),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
+    let (addr, run): (crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>) =
+        match listener {
+            DaemonListener::Tcp(listener) => {
+                let srv = SccacheServer::<_>::with_listener(
+                    listener, runtime, client, dist_client, storage,
+                );
+                (srv.local_addr().unwrap(), Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>)
             }
             #[cfg(unix)]
-            crate::net::SocketAddr::Unix(path) => {
-                trace!("binding unix socket {}", path.display());
-                // An active listener must never be unlinked by another
-                // concurrent server startup.
-                let (l, socket_lock) = {
-                    let _guard = runtime.enter();
-                    bind_unix_socket(path)?
-                };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                Ok((
-                    srv.local_addr().unwrap(),
-                    Box::new(move |f| {
-                        let _socket_lock = socket_lock;
-                        srv.run(f)
-                    }) as Box<dyn FnOnce(_) -> _>,
-                ))
+            DaemonListener::Unix(listener, owner) => {
+                let srv = SccacheServer::<_>::with_listener(
+                    listener, runtime, client, dist_client, storage,
+                );
+                (srv.local_addr().unwrap(), Box::new(move |f| {
+                    let _owner = owner;
+                    srv.run(f)
+                }) as Box<dyn FnOnce(_) -> _>)
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            crate::net::SocketAddr::UnixAbstract(p) => {
-                trace!("binding abstract unix socket {}", p.escape_ascii());
-                let abstract_addr = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
-                let l = std::os::unix::net::UnixListener::bind_addr(&abstract_addr)?;
-                l.set_nonblocking(true)?;
-                let l = {
-                    let _guard = runtime.enter();
-                    tokio::net::UnixListener::from_std(l)?
-                };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                Ok((
-                    srv.local_addr()
-                        .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
+            DaemonListener::Abstract(listener, name) => {
+                let srv = SccacheServer::<_>::with_listener(
+                    listener, runtime, client, dist_client, storage,
+                );
+                (srv.local_addr().unwrap_or(crate::net::SocketAddr::UnixAbstract(name)),
+                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>)
             }
-        }
-    })();
-    match res {
-        Ok((addr, run)) => {
-            info!("server started, listening on {addr}");
-            notify_server_startup(
-                notify.as_ref(),
-                ServerStartup::Ok {
-                    addr: addr.to_string(),
-                },
-            )?;
-            run(future::pending::<()>()).map_err(anyhow::Error::from)?;
-            Ok(())
-        }
-        Err(e) => {
-            error!("failed to start server: {}", e);
-            if io::ErrorKind::AddrInUse == e.kind() {
-                notify_server_startup(notify.as_ref(), ServerStartup::AddrInUse)?;
-            } else if cfg!(windows) && Some(10013) == e.raw_os_error() {
-                // 10013 is the "WSAEACCES" error, which can occur if the requested port
-                // has been allocated for other purposes, such as winNAT or Hyper-V.
-                let windows_help_message = "A Windows port exclusion is blocking use of the configured port.\nTry setting SCCACHE_SERVER_PORT to a new value.";
-                let reason: String = format!("{windows_help_message}\n{e}");
-                notify_server_startup(notify.as_ref(), ServerStartup::Err { reason })?;
-            } else {
-                let reason = e.to_string();
-                notify_server_startup(notify.as_ref(), ServerStartup::Err { reason })?;
-            }
-            Err(e.into())
-        }
+        };
+    run_ready_server(notify.as_ref(), &addr, || run(future::pending::<()>()))
+}
+
+fn run_ready_server<F>(notify: Option<&OsString>, addr: &crate::net::SocketAddr, run: F) -> Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    info!("server started, listening on {addr}");
+    if let Err(error) = notify_server_startup(
+        notify,
+        ServerStartup::Ok { addr: addr.to_string() },
+    ) {
+        // A later follower can still be waiting after the original launcher
+        // reaches its deadline. The launcher does not own the ready daemon.
+        warn!("could not notify original launcher of ready server: {error}");
     }
+    run().map_err(anyhow::Error::from)
 }
 
 pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = ProcessCommandCreator> {
@@ -758,6 +869,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         // connection loop below, but the shutdown path still has to stop its
         // renewal tasks and release what it can.
         let lease_keeper = Arc::clone(&service.lease_keeper);
+        let request_activity = Arc::clone(&service.info.info);
 
         // Create our "server future" which will simply handle all incoming
         // connections in separate tasks.
@@ -795,6 +907,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let shutdown_idle = async {
             ShutdownOrInactive {
                 rx,
+                request_activity,
                 timeout: if timeout != Duration::new(0, 0) {
                     Some(Box::pin(sleep(timeout)))
                 } else {
@@ -954,8 +1067,12 @@ where
         drop(self.tx.clone().start_send(ServerMessage::Request));
 
         let me = self.clone();
+        let request = me.info.begin_request();
         Box::pin(async move {
-            match req.into_inner() {
+            let response = match req.into_inner() {
+                Request::ServerReady => {
+                    Ok(Message::WithoutBody(Response::ServerStartup(Ok(()))))
+                }
                 Request::Compile(compile) => {
                     debug!("handle_client: compile");
                     me.stats.lock().await.compile_requests += 1;
@@ -1073,7 +1190,14 @@ where
                     me.merge_stats(*delta).await;
                     Ok(Message::WithoutBody(Response::RecordStats))
                 }
-            }
+            }?;
+            Ok(match response {
+                Message::WithBody(response, body) => Message::WithBody(response, Box::pin(async move {
+                    let _request = request;
+                    body.await
+                }) as Pin<Box<dyn Future<Output = Result<Response>> + Send>>),
+                Message::WithoutBody(response) => Message::WithoutBody(response),
+            })
         })
     }
 
@@ -1588,8 +1712,10 @@ where
         };
 
         let me = self.clone();
+        let request = self.info.begin_request();
 
         util::spawn_on(&self.rt, async move {
+            let _request = request;
             let result = match me.dist_client.get_client().await {
                 Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
                     &me,
@@ -2510,6 +2636,7 @@ struct ShutdownOrInactive {
     rx: mpsc::Receiver<ServerMessage>,
     timeout: Option<Pin<Box<Sleep>>>,
     timeout_dur: Duration,
+    request_activity: Arc<parking_lot::Mutex<Info>>,
     #[cfg(feature = "dist-client")]
     lease_keeper: Arc<crate::dist::lease::BuildLeaseKeeper>,
 }
@@ -2530,6 +2657,21 @@ impl Future for ShutdownOrInactive {
                 }
                 // All services have shut down, in theory this isn't possible...
                 Poll::Ready(None) => return Poll::Ready(()),
+            }
+        }
+        let (active_requests, completed_at) = {
+            let mut activity = self.request_activity.lock();
+            activity.idle_waker = Some(cx.waker().clone());
+            (activity.requests, activity.completed_at)
+        };
+        if active_requests != 0 {
+            return Poll::Pending;
+        }
+        let timeout_dur = self.timeout_dur;
+        if let (Some(timeout), Some(completed_at)) = (&mut self.timeout, completed_at) {
+            let deadline = completed_at + timeout_dur;
+            if timeout.deadline() < deadline {
+                timeout.as_mut().reset(deadline);
             }
         }
         let elapsed = match &mut self.timeout {
@@ -2555,17 +2697,42 @@ impl Future for ShutdownOrInactive {
 /// Helper future which tracks the `ActiveInfo` below. This future will resolve
 /// once all instances of `ActiveInfo` have been dropped.
 pub(crate) struct WaitUntilZero {
-    info: std::sync::Weak<std::sync::Mutex<Info>>,
+    info: std::sync::Weak<parking_lot::Mutex<Info>>,
 }
 
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct ActiveInfo {
-    info: Arc<std::sync::Mutex<Info>>,
+    info: Arc<parking_lot::Mutex<Info>>,
 }
 
 struct Info {
     waker: Option<Waker>,
+    idle_waker: Option<Waker>,
+    requests: usize,
+    completed_at: Option<tokio::time::Instant>,
+}
+
+struct ActiveRequest {
+    info: Arc<parking_lot::Mutex<Info>>,
+}
+
+impl ActiveInfo {
+    fn begin_request(&self) -> ActiveRequest {
+        self.info.lock().requests += 1;
+        ActiveRequest { info: Arc::clone(&self.info) }
+    }
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        let mut info = self.info.lock();
+        info.requests -= 1;
+        info.completed_at = Some(tokio::time::Instant::now());
+        if let Some(waker) = info.idle_waker.take() {
+            waker.wake();
+        }
+    }
 }
 
 impl Drop for Info {
@@ -2579,7 +2746,12 @@ impl Drop for Info {
 impl WaitUntilZero {
     #[rustfmt::skip]
     pub(crate) fn new() -> (WaitUntilZero, ActiveInfo) {
-        let info = Arc::new(std::sync::Mutex::new(Info { waker: None }));
+        let info = Arc::new(parking_lot::Mutex::new(Info {
+            waker: None,
+            idle_waker: None,
+            requests: 0,
+            completed_at: None,
+        }));
 
         (WaitUntilZero { info: Arc::downgrade(&info) }, ActiveInfo { info })
     }
@@ -2592,7 +2764,7 @@ impl std::future::Future for WaitUntilZero {
         match self.info.upgrade() {
             None => std::task::Poll::Ready(()),
             Some(arc) => {
-                let mut info = arc.lock().expect("we can't panic when holding lock");
+                let mut info = arc.lock();
                 info.waker = Some(cx.waker().clone());
                 std::task::Poll::Pending
             }
@@ -2628,6 +2800,187 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancelled_launcher_does_not_kill_ready_daemon_for_later_follower() {
+        let notification_dir = tempfile::tempdir().unwrap();
+        let notify = notification_dir.path().join("notify");
+        let original_launcher = std::os::unix::net::UnixListener::bind(&notify).unwrap();
+        drop(original_launcher);
+        drop(notification_dir);
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        let (initialize, initialization) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let address = listener.local_addr().unwrap();
+            address_tx.send(address).unwrap();
+            initialization.recv().unwrap();
+            let storage = Arc::new(crate::cache::disk::DiskCache::new(
+                dir.path().as_os_str(), 1024, runtime.handle(), Default::default(),
+                CacheMode::ReadWrite, Vec::new(),
+            ));
+            let daemon = SccacheServer::<tokio::net::TcpListener>::with_listener(
+                listener, runtime, Client::new_num(1),
+                DistClientContainer::new_disabled(), storage,
+            );
+            run_ready_server(
+                Some(&notify.into_os_string()), &crate::net::SocketAddr::Net(address),
+                || daemon.run(future::pending::<()>()),
+            ).unwrap();
+        });
+        // Connect while the daemon still owns only a reservation, then let its
+        // initialization finish after the original launcher is already gone.
+        let stream = std::net::TcpStream::connect(address_rx.recv().unwrap()).unwrap();
+        let mut follower = crate::client::ServerConnection::new(Box::new(stream)).unwrap();
+        initialize.send(()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(matches!(follower.request_with_deadline(
+            Request::ServerReady,
+            std::time::Instant::now() + crate::commands::SERVER_STARTUP_TIMEOUT,
+            &runtime,
+        ).unwrap(), Response::ServerStartup(Ok(()))));
+        assert!(matches!(follower.request(Request::Shutdown).unwrap(), Response::ShuttingDown(_)));
+        drop(follower);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_initialization_reaches_queued_and_late_followers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut peers = Vec::new();
+            for _ in 0..12 {
+                peers.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+            }
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let publisher = tokio::spawn(async move {
+                serve_startup_failure(&listener, "shared storage initialization failure", stopped).await
+            });
+            // A follower can still be connecting after its AddrInUse notice.
+            for _ in 0..12 {
+                peers.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+            }
+            let payload = bincode::serialize(&Request::ServerReady).unwrap();
+            let responses = futures::future::join_all(peers.into_iter().map(|mut socket| {
+                let payload = payload.clone();
+                async move {
+                    socket.write_all(&(payload.len() as u32).to_be_bytes()).await.unwrap();
+                    socket.write_all(&payload).await.unwrap();
+                    let mut header = [0; 4];
+                    socket.read_exact(&mut header).await.unwrap();
+                    let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    match bincode::deserialize::<Response>(&body).unwrap() {
+                        Response::ServerStartup(Err(reason)) => {
+                            assert_eq!(reason, "shared storage initialization failure");
+                        }
+                        other => panic!("unexpected initialization response: {other:?}"),
+                    }
+                }
+            }));
+            time::timeout(crate::commands::SERVER_STARTUP_TIMEOUT, responses).await.unwrap();
+            stop.send(()).unwrap();
+            publisher.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn pending_requests_prevent_idle_shutdown_and_restart_idle_interval() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let (_wait, active) = WaitUntilZero::new();
+        let request = active.begin_request();
+        let (_tx, rx) = mpsc::channel(1);
+        let now = tokio::time::Instant::now();
+        let mut shutdown = Box::pin(ShutdownOrInactive {
+            rx,
+            timeout: Some(Box::pin(tokio::time::sleep_until(now - Duration::from_secs(1)))),
+            timeout_dur: Duration::from_secs(1),
+            request_activity: Arc::clone(&active.info),
+            #[cfg(feature = "dist-client")]
+            lease_keeper: build_lease_keeper(&Arc::new(DistClientContainer::new_disabled()), runtime.handle()),
+        });
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+        drop(request);
+        assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+        let completed_at = active.info.lock().completed_at.unwrap();
+        assert_eq!(shutdown.timeout.as_ref().unwrap().deadline(), completed_at + Duration::from_secs(1));
+        // Model an elapsed full idle interval without depending on wall time.
+        active.info.lock().completed_at = Some(now - Duration::from_secs(2));
+        shutdown.timeout.as_mut().unwrap().as_mut().reset(now - Duration::from_secs(1));
+        assert!(shutdown.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn explicit_shutdown_is_not_blocked_by_pending_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let (_wait, active) = WaitUntilZero::new();
+        let _request = active.begin_request();
+        let (mut tx, rx) = mpsc::channel(1);
+        tx.start_send(ServerMessage::Shutdown).unwrap();
+        let shutdown = ShutdownOrInactive {
+            rx,
+            timeout: None,
+            timeout_dur: Duration::ZERO,
+            request_activity: Arc::clone(&active.info),
+            #[cfg(feature = "dist-client")]
+            lease_keeper: build_lease_keeper(&Arc::new(DistClientContainer::new_disabled()), runtime.handle()),
+        };
+        assert_eq!(shutdown.now_or_never(), Some(()));
+    }
+
+    #[test]
+    fn tcp_reservation_rejects_duplicate_and_releases_on_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reservation = DaemonListener::bind(&crate::net::SocketAddr::with_port(0), &runtime).unwrap();
+        let DaemonListener::Tcp(listener) = &reservation else { panic!("expected TCP listener") };
+        let addr = crate::net::SocketAddr::Net(listener.local_addr().unwrap());
+        let error = DaemonListener::bind(&addr, &runtime).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        drop(reservation);
+        assert!(DaemonListener::bind(&addr, &runtime).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_reservation_removes_owned_socket_on_initialization_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server");
+        let addr = crate::net::SocketAddr::Unix(path.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reservation = DaemonListener::bind(&addr, &runtime).unwrap();
+        drop(reservation);
+        assert!(!path.exists());
+        assert!(DaemonListener::bind(&addr, &runtime).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unix_listener_survives_duplicate_startup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server");
@@ -2649,9 +3002,9 @@ mod tests {
     fn concurrent_unix_startups_keep_one_reachable_listener() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server");
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let bound = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let contenders: Vec<_> = (0..2)
+        let start = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let bound = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let contenders: Vec<_> = (0..24)
             .map(|_| {
                 let path = path.clone();
                 let start = start.clone();
@@ -2663,7 +3016,7 @@ mod tests {
                         .unwrap();
                     let _enter = runtime.enter();
                     start.wait();
-                    let result = bind_unix_socket(&path);
+                    let result = DaemonListener::bind(&crate::net::SocketAddr::Unix(path.clone()), &runtime);
                     bound.wait();
                     match result {
                         Ok(_listener) => {
@@ -2685,7 +3038,7 @@ mod tests {
                 .iter()
                 .filter(|result| **result == Err(io::ErrorKind::AddrInUse))
                 .count(),
-            1
+            23
         );
     }
 
@@ -2699,7 +3052,13 @@ mod tests {
             .build()
             .unwrap();
         let _enter = runtime.enter();
-        let listener = bind_unix_socket(&path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        std::fs::write(
+            dir.path().join("server.billdfaster.lock"),
+            format!("billdfaster-socket-v1 {} {}\n", metadata.dev(), metadata.ino()),
+        ).unwrap();
         drop(listener);
         let replacement = bind_unix_socket(&path).unwrap();
         assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());

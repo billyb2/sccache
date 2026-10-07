@@ -1021,20 +1021,36 @@ impl ServerIncoming for Server {
             server: self,
             job_id,
         };
-        let result = {
-            let mut cache = self.cache.lock().unwrap();
+        let staged = {
+            let cache = self.cache.lock().unwrap();
             if cache.contains_toolchain(&tc) {
-                drop(cache);
-                io::copy(&mut { tc_rdr }, &mut io::sink())
-                    .context("Draining duplicate toolchain upload failed")?;
+                None
+            } else {
+                Some(cache.stage_file()?)
+            }
+        };
+        let result = if staged.is_none() {
+            io::copy(&mut { tc_rdr }, &mut io::sink())
+                .context("Draining duplicate toolchain upload failed")?;
+            // Draining is deliberately unlocked. Recheck residency before
+            // acknowledging: the archive may have been evicted meanwhile.
+            if self.cache.lock().unwrap().get_file(&tc).is_ok() {
                 SubmitToolchainResult::Success
             } else {
-                cache
-                    .insert_with(&tc, |mut file| {
-                        io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
-                    })
-                    .map(|_| SubmitToolchainResult::Success)
-                    .unwrap_or(SubmitToolchainResult::CannotCache)
+                SubmitToolchainResult::CannotCache
+            }
+        } else {
+            let mut file = staged.expect("cache miss has a staging file");
+            let inserted = (|| -> Result<()> {
+                TcCache::stage_upload(&tc, tc_rdr, &mut file)?;
+                self.cache.lock().unwrap().commit_staged(&tc, file)
+            })();
+            match inserted {
+                Ok(()) => SubmitToolchainResult::Success,
+                Err(error) => {
+                    warn!("Cannot cache toolchain for job {}: {:#}", job_id, error);
+                    SubmitToolchainResult::CannotCache
+                }
             }
         };
         let transitioned = if matches!(result, SubmitToolchainResult::Success) {
@@ -1135,6 +1151,106 @@ impl ServerIncoming for Server {
 #[cfg(test)]
 mod worker_recovery_tests {
     use super::*;
+
+    struct Acknowledge;
+    impl ServerOutgoing for Acknowledge {
+        fn do_update_job_state(&self, _: JobId, _: JobState) -> Result<UpdateJobStateResult> {
+            Ok(UpdateJobStateResult::Success)
+        }
+    }
+
+    fn archive(bytes: &[u8]) -> Toolchain {
+        Toolchain {
+            archive_id: sccache::util::Digest::reader_sync(bytes).unwrap(),
+        }
+    }
+
+    struct PausedReader {
+        started: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        bytes: io::Cursor<Vec<u8>>,
+    }
+
+    impl io::Read for PausedReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            io::Read::read(&mut self.bytes, bytes)
+        }
+    }
+
+    #[test]
+    fn slow_body_does_not_block_assignments_or_cached_confirmations() {
+        let (_directory, server) = worker();
+        let cached = archive(b"cached");
+        server.cache.lock().unwrap().insert_with(&cached, |mut file| {
+            io::Write::write_all(&mut file, b"cached")
+        }).unwrap();
+        let incoming = archive(b"incoming");
+        server.handle_assign_job(JobId(0), incoming.clone()).unwrap();
+        server.handle_assign_job(JobId(1), incoming).unwrap();
+        let (started, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let upload = scope.spawn(|| server.handle_submit_toolchain(
+                &Acknowledge, JobId(0),
+                ToolchainReader::new(PausedReader {
+                    started: Some(started), release: wait,
+                    bytes: io::Cursor::new(b"incoming".to_vec()),
+                }),
+            ).unwrap());
+            observed.recv().unwrap();
+            assert!(server.cache.try_lock().is_ok());
+            assert!(!server.handle_assign_job(JobId(2), cached).unwrap().need_toolchain);
+            assert!(matches!(server.handle_submit_toolchain(
+                &Acknowledge, JobId(2), ToolchainReader::new(io::empty()),
+            ).unwrap(), SubmitToolchainResult::Success));
+            release.send(()).unwrap();
+            assert!(matches!(upload.join().unwrap(), SubmitToolchainResult::Success));
+        });
+        assert!(matches!(server.handle_submit_toolchain(
+            &Acknowledge, JobId(1), ToolchainReader::new(io::empty()),
+        ).unwrap(), SubmitToolchainResult::Success));
+        let ledger = server.jobs.lock().unwrap();
+        for job_id in [JobId(0), JobId(1), JobId(2)] {
+            assert!(matches!(ledger.jobs[&job_id].job, WorkerJob::Ready { .. }));
+        }
+    }
+
+    #[test]
+    fn bad_or_truncated_body_never_becomes_resident_or_ready() {
+        let (directory, server) = worker();
+        let expected = archive(b"complete archive");
+        for (id, bytes) in [b"corrupt archive".as_slice(), b"complete".as_slice()].into_iter().enumerate() {
+            let job_id = JobId(id as u64);
+            server.handle_assign_job(job_id, expected.clone()).unwrap();
+            assert!(matches!(server.handle_submit_toolchain(
+                &Acknowledge, job_id, ToolchainReader::new(bytes),
+            ).unwrap(), SubmitToolchainResult::CannotCache));
+            assert!(!server.cache.lock().unwrap().contains_toolchain(&expected));
+            assert!(matches!(server.jobs.lock().unwrap().jobs[&job_id].job, WorkerJob::Pending { .. }));
+        }
+        drop(server);
+        assert!(TcCache::new(directory.path(), 1024 * 1024).unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_confirmation_after_eviction_is_not_acknowledged() {
+        let (_directory, server) = worker();
+        let tc = archive(b"archive");
+        server.handle_assign_job(JobId(0), tc.clone()).unwrap();
+        server.handle_assign_job(JobId(1), tc.clone()).unwrap();
+        assert!(matches!(server.handle_submit_toolchain(
+            &Acknowledge, JobId(0), ToolchainReader::new(b"archive".as_slice()),
+        ).unwrap(), SubmitToolchainResult::Success));
+        server.cache.lock().unwrap().remove(&tc).unwrap();
+        assert!(matches!(server.handle_submit_toolchain(
+            &Acknowledge, JobId(1), ToolchainReader::new(io::empty()),
+        ).unwrap(), SubmitToolchainResult::CannotCache));
+        assert!(matches!(server.jobs.lock().unwrap().jobs[&JobId(1)].job, WorkerJob::Pending { .. }));
+    }
 
     struct UnusedBuilder;
     impl BuilderIncoming for UnusedBuilder {

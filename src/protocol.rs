@@ -35,6 +35,8 @@ pub enum Request {
     StoragePutPreprocessorEntry { key: String, entry_bytes: Vec<u8> },
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),
+    /// Wait for the elected daemon's initialization outcome before using it.
+    ServerReady,
 }
 
 /// A server response.
@@ -68,6 +70,8 @@ pub enum Response {
     StoragePutPreprocessorEntry(Result<(), String>),
     /// Response for `Request::RecordStats`.
     RecordStats,
+    /// Shared initialization outcome for `Request::ServerReady`.
+    ServerStartup(Result<(), String>),
 }
 
 /// Possible responses from the server for a `Compile` request.

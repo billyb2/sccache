@@ -1,7 +1,7 @@
 use crate::dist::Toolchain;
 use crate::lru_disk_cache::Result as LruResult;
 use crate::lru_disk_cache::{LruDiskCache, ReadSeek};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, bail};
 use fs_err as fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,7 @@ mod client {
     // TODO: possibly shouldn't be public
     pub struct ClientToolchains {
         cache_dir: PathBuf,
+        toolchain_creation_dir: tempfile::TempDir,
         cache: Mutex<TcCache>,
         // Lookup from dist toolchain -> path to custom toolchain archive
         custom_toolchain_archives: Mutex<HashMap<Toolchain, PathBuf>>,
@@ -66,17 +67,10 @@ mod client {
                 cache_dir.display()
             ))?;
 
-            let toolchain_creation_dir = cache_dir.join("toolchain_tmp");
-            if toolchain_creation_dir.exists() {
-                fs::remove_dir_all(&toolchain_creation_dir).context(format!(
-                    "failed to clean up temporary toolchain creation directory: {}",
-                    toolchain_creation_dir.display()
-                ))?;
-            }
-            fs::create_dir(&toolchain_creation_dir).context(format!(
-                "failed to create temporary toolchain creation directory: {}",
-                toolchain_creation_dir.display()
-            ))?;
+            let toolchain_creation_dir = tempfile::Builder::new()
+                .prefix("toolchain_tmp-")
+                .tempdir_in(&cache_dir)
+                .context("failed to create temporary toolchain creation directory")?;
 
             let weak_map_path = cache_dir.join("weak_map.json");
             if !weak_map_path.exists() {
@@ -154,6 +148,7 @@ mod client {
 
             Ok(Self {
                 cache_dir,
+                toolchain_creation_dir,
                 cache,
                 custom_toolchain_archives: Mutex::new(HashMap::new()),
                 custom_toolchain_paths,
@@ -212,7 +207,7 @@ mod client {
                 return Ok((Toolchain { archive_id }, None));
             }
             debug!("Weak key {} appears to be new", weak_key);
-            let tmpfile = tempfile::NamedTempFile::new_in(self.cache_dir.join("toolchain_tmp"))?;
+            let tmpfile = tempfile::NamedTempFile::new_in(self.toolchain_creation_dir.path())?;
             toolchain_packager
                 .write_pkg(fs_err::File::from_parts(tmpfile.reopen()?, tmpfile.path()))
                 .context("Could not package toolchain")?;
@@ -295,6 +290,26 @@ mod client {
         use std::io::Write;
 
         use super::ClientToolchains;
+
+        #[test]
+        fn toolchain_staging_directories_are_owned_by_each_client() {
+            let root = tempfile::tempdir().unwrap();
+            let first = ClientToolchains::new(root.path(), 1024, &[]).unwrap();
+            let first_dir = first.toolchain_creation_dir.path().to_owned();
+            let first_file = first_dir.join("live");
+            std::fs::write(&first_file, b"first").unwrap();
+            let second = ClientToolchains::new(root.path(), 1024, &[]).unwrap();
+            let second_dir = second.toolchain_creation_dir.path().to_owned();
+            assert_ne!(first_dir, second_dir);
+            assert_eq!(std::fs::read(first_file).unwrap(), b"first");
+            let second_file = second_dir.join("live");
+            std::fs::write(&second_file, b"second").unwrap();
+            drop(first);
+            assert!(!first_dir.exists());
+            assert_eq!(std::fs::read(second_file).unwrap(), b"second");
+            drop(second);
+            assert!(!second_dir.exists());
+        }
 
         struct PanicToolchainPackager;
         impl PanicToolchainPackager {
@@ -481,15 +496,52 @@ impl TcCache {
         tc: &Toolchain,
         with: F,
     ) -> Result<()> {
-        self.inner
-            .insert_with(make_lru_key_path(&tc.archive_id), with)?;
-        let verified_archive_id = file_key(self.get(tc)?)?;
-        // TODO: remove created toolchain?
-        if verified_archive_id == tc.archive_id {
-            Ok(())
-        } else {
-            Err(anyhow!("written file does not match expected hash key"))
+        let mut file = self.stage_file()?;
+        with(fs::File::from_parts(file.reopen()?, file.path()))?;
+        Self::verify_staged(tc, &mut file)?;
+        self.commit_staged(tc, file)
+    }
+
+    pub fn stage_file(&self) -> Result<tempfile::NamedTempFile> {
+        Ok(self.inner.stage_file()?)
+    }
+
+    /// Stream and hash the upload once, without making it cache-resident.
+    pub fn stage_upload<R: Read>(
+        tc: &Toolchain,
+        reader: R,
+        file: &mut tempfile::NamedTempFile,
+    ) -> Result<()> {
+        struct CopyTo<'a, R> {
+            reader: R,
+            file: &'a mut std::fs::File,
         }
+        impl<R: Read> Read for CopyTo<'_, R> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = self.reader.read(buffer)?;
+                io::Write::write_all(self.file, &buffer[..count])?;
+                Ok(count)
+            }
+        }
+        let archive_id = file_key(CopyTo { reader, file: file.as_file_mut() })?;
+        if archive_id != tc.archive_id {
+            bail!("written file does not match expected hash key");
+        }
+        Ok(())
+    }
+
+    pub fn verify_staged(tc: &Toolchain, file: &mut tempfile::NamedTempFile) -> Result<()> {
+        if file_key(file.reopen()?)? != tc.archive_id {
+            bail!("written file does not match expected hash key");
+        }
+        Ok(())
+    }
+
+    pub fn commit_staged(&mut self, tc: &Toolchain, file: tempfile::NamedTempFile) -> Result<()> {
+        if !self.contains_toolchain(tc) {
+            self.inner.insert_staged(make_lru_key_path(&tc.archive_id), file)?;
+        }
+        Ok(())
     }
 
     pub fn get_file(&mut self, tc: &Toolchain) -> LruResult<fs::File> {

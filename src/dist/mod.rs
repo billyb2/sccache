@@ -697,6 +697,12 @@ pub struct BuildResult {
 // structs
 
 pub struct ToolchainReader<'a>(Box<dyn Read + 'a>);
+impl<'a> ToolchainReader<'a> {
+    pub fn new(reader: impl Read + 'a) -> Self {
+        Self(Box::new(reader))
+    }
+}
+
 impl Read for ToolchainReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)

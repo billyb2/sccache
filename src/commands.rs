@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cache::{IpcStorage, storage_from_config};
-use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
+use crate::client::{ServerConnection, connect_to_server};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
 use crate::config::{Config, default_disk_cache_dir};
@@ -38,7 +38,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use strip_ansi_escapes::Writer;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::{Builder, Runtime};
@@ -51,7 +51,7 @@ use crate::errors::*;
 pub const DEFAULT_PORT: u16 = 4226;
 
 /// The number of milliseconds to wait for server startup.
-const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_millis(10000);
+pub(crate) const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_millis(10000);
 
 /// Get the port on which the server should listen.
 fn get_addr() -> crate::net::SocketAddr {
@@ -317,7 +317,9 @@ fn connect_or_start_server(
     startup_timeout: Option<Duration>,
 ) -> Result<ServerConnection> {
     trace!("connect_or_start_server({addr})");
-    match connect_to_server(addr) {
+    let deadline = Instant::now() + startup_timeout.unwrap_or(SERVER_STARTUP_TIMEOUT);
+    let runtime = new_client_runtime()?;
+    let server: Result<ServerConnection> = match connect_before_deadline(addr, &runtime, deadline) {
         Ok(server) => Ok(server),
         Err(ref e)
             if (e.kind() == io::ErrorKind::ConnectionRefused
@@ -326,10 +328,10 @@ fn connect_or_start_server(
         {
             // If the connection was refused we probably need to start
             // the server.
-            match run_server_process(startup_timeout)? {
+            match run_server_process(Some(startup_remaining(deadline)?))? {
                 ServerStartup::Ok { addr: actual_addr } => {
                     if addr.to_string() != actual_addr {
-                        // bail as the next connect_with_retry will fail
+                        // The configured endpoint must match the elected listener.
                         bail!("sccache: Listening on address {actual_addr} instead of {addr}");
                     }
                 }
@@ -344,11 +346,65 @@ fn connect_or_start_server(
                     reason
                 ),
             }
-            let server = connect_with_retry(addr)?;
+            let mut connected = None;
+            for attempt in 0..=10 {
+                match connect_before_deadline(addr, &runtime, deadline) {
+                    Ok(server) => {
+                        connected = Some(server);
+                        break;
+                    }
+                    Err(error) if attempt < 10 => {
+                        debug!("waiting for elected daemon connection: {error}");
+                        std::thread::sleep(Duration::from_millis(500).min(startup_remaining(deadline)?));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let server = connected.expect("connection retry must return a connection or error");
             Ok(server)
         }
         Err(e) => Err(e.into()),
+    };
+    let mut server = server?;
+    match server.request_with_deadline(Request::ServerReady, deadline, &runtime)
+        .context("waiting for elected server initialization")? {
+        Response::ServerStartup(Ok(())) => Ok(server),
+        Response::ServerStartup(Err(reason)) => bail!("Server startup failed: {reason}"),
+        _ => bail!("Unexpected server readiness response"),
     }
+}
+
+fn startup_remaining(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for server startup"))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn connect_before_deadline(
+    addr: &crate::net::SocketAddr,
+    runtime: &Runtime,
+    deadline: Instant,
+) -> io::Result<ServerConnection> {
+    let remaining = startup_remaining(deadline)?;
+    runtime.block_on(async {
+        tokio::time::timeout(remaining, async {
+            loop {
+                match crate::net::connect_async(addr).await {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        // A full Unix backlog belongs to the elected listener,
+                        // not another startup candidate. Wait under this deadline.
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    result => return result.and_then(ServerConnection::new),
+                }
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timed out connecting to elected server"))?
+    })
 }
 
 /// Send a `ZeroStats` request to the server, and return the `ServerInfo` request if successful.
@@ -972,6 +1028,19 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn reserved_listener_does_not_bypass_configured_startup_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = crate::net::SocketAddr::Net(listener.local_addr().unwrap());
+        // The reserved endpoint accepts a kernel connection, but initialization
+        // has not enabled request handling or a readiness response.
+        let error = connect_or_start_server(&addr, Some(Duration::from_millis(250)))
+            .err().expect("an uninitialized listener must not report readiness");
+        assert!(error.chain().any(|cause| cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        })));
+    }
     use crate::jobserver::Client;
     use crate::mock_command::{
         CommandCreator, ExitStatusValue, MockChild, MockCommandCreator, exit_status,

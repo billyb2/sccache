@@ -322,6 +322,29 @@ impl LruDiskCache {
         })
     }
 
+    /// Create an unindexed staging file on the cache filesystem.
+    pub fn stage_file(&self) -> Result<NamedTempFile> {
+        Ok(tempfile::Builder::new()
+            .prefix(TEMPFILE_PREFIX)
+            .tempfile_in(&self.root)?)
+    }
+
+    /// Atomically take ownership of a staged file without a copy fallback.
+    pub fn insert_staged<K: AsRef<OsStr>>(
+        &mut self,
+        key: K,
+        file: NamedTempFile,
+    ) -> Result<()> {
+        let size = file.as_file().metadata()?.len();
+        self.make_space(size)?;
+        let key = key.as_ref().to_owned();
+        let path = self.rel_to_abs_path(&key);
+        fs::create_dir_all(path.parent().expect("Bad path?"))?;
+        file.persist(path).map_err(|e| e.error)?;
+        self.lru.insert(key, size);
+        Ok(())
+    }
+
     /// Prepare the insertion of a file at path `key`. The resulting entry must be
     /// committed with `LruDiskCache::commit`.
     pub fn prepare_add<'a, K: AsRef<OsStr> + 'a>(
@@ -429,6 +452,33 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[test]
+    fn staged_commit_moves_file_and_preserves_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cache = LruDiskCache::new(directory.path(), 8).unwrap();
+        cache.insert_bytes("old", b"123456").unwrap();
+        let mut staged = cache.stage_file().unwrap();
+        staged.write_all(b"abcdef").unwrap();
+        let original = staged.path().to_owned();
+        assert_eq!(cache.len(), 1);
+        cache.insert_staged("new", staged).unwrap();
+        assert!(!original.exists());
+        assert!(!cache.contains_key("old"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 6);
+        let mut staged = cache.stage_file().unwrap();
+        staged.write_all(b"too large").unwrap();
+        let original = staged.path().to_owned();
+        assert!(matches!(cache.insert_staged("oversized", staged), Err(Error::FileTooLarge)));
+        assert!(!original.exists());
+        assert!(!cache.contains_key("oversized"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 6);
+        let mut contents = Vec::new();
+        cache.get_file("new").unwrap().read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"abcdef");
+    }
 
     struct TestFixture {
         /// Temp directory.

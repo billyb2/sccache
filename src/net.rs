@@ -112,8 +112,17 @@ impl Acceptor for tokio::net::TcpListener {
 }
 
 // A helper trait to unify the behavior of TCP and UDS stream.
+pub trait AsyncConnection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncConnection for T {}
+
 pub trait Connection: std::io::Read + std::io::Write + Send {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>>;
+    fn try_clone_async(&self) -> std::io::Result<Box<dyn AsyncConnection>> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    fn set_nonblocking(&self, _nonblocking: bool) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 impl Connection for std::net::TcpStream {
@@ -121,6 +130,16 @@ impl Connection for std::net::TcpStream {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
         let stream = std::net::TcpStream::try_clone(self)?;
         Ok(Box::new(stream))
+    }
+
+    fn try_clone_async(&self) -> std::io::Result<Box<dyn AsyncConnection>> {
+        let stream = std::net::TcpStream::try_clone(self)?;
+        stream.set_nonblocking(true)?;
+        Ok(Box::new(tokio::net::TcpStream::from_std(stream)?))
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        std::net::TcpStream::set_nonblocking(self, nonblocking)
     }
 }
 
@@ -140,6 +159,30 @@ pub fn connect(addr: &SocketAddr) -> std::io::Result<Box<dyn Connection>> {
             let sock = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
             std::os::unix::net::UnixStream::connect_addr(&sock)
                 .map(|s| Box::new(s) as Box<dyn Connection>)
+        }
+    }
+}
+
+/// Cancellable connection establishment for the configured startup deadline.
+pub async fn connect_async(addr: &SocketAddr) -> std::io::Result<Box<dyn Connection>> {
+    match addr {
+        SocketAddr::Net(addr) => {
+            let stream = tokio::net::TcpStream::connect(addr).await?.into_std()?;
+            stream.set_nonblocking(false)?;
+            Ok(Box::new(stream))
+        }
+        #[cfg(unix)]
+        SocketAddr::Unix(path) => {
+            let stream = tokio::net::UnixStream::connect(path).await?.into_std()?;
+            stream.set_nonblocking(false)?;
+            Ok(Box::new(stream))
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        SocketAddr::UnixAbstract(name) => {
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+            let stream = tokio::net::UnixStream::connect_addr(&addr.into()).await?.into_std()?;
+            stream.set_nonblocking(false)?;
+            Ok(Box::new(stream))
         }
     }
 }
@@ -179,6 +222,16 @@ mod unix_imp {
         fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
             let stream = std::os::unix::net::UnixStream::try_clone(self)?;
             Ok(Box::new(stream))
+        }
+
+        fn try_clone_async(&self) -> std::io::Result<Box<dyn AsyncConnection>> {
+            let stream = std::os::unix::net::UnixStream::try_clone(self)?;
+            stream.set_nonblocking(true)?;
+            Ok(Box::new(tokio::net::UnixStream::from_std(stream)?))
+        }
+
+        fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+            std::os::unix::net::UnixStream::set_nonblocking(self, nonblocking)
         }
     }
 }
