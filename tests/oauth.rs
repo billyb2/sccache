@@ -53,6 +53,7 @@ fn config_with_dist_auth(
         dist: sccache::config::DistConfig {
             auth: auth_config,
             scheduler_url: None,
+            quic: false,
             cache_dir: tmpdir.join("unused-cache"),
             toolchains: vec![],
             toolchain_cache_size: 0,

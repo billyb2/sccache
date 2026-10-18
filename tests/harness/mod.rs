@@ -186,6 +186,7 @@ pub fn sccache_client_cfg(
         dist: sccache::config::DistConfig {
             auth: Default::default(), // dangerously_insecure
             scheduler_url: None,
+            quic: false,
             cache_dir: tmpdir.join(dist_cache_relpath),
             toolchains: vec![],
             toolchain_cache_size: TC_CACHE_SIZE,
