@@ -193,6 +193,8 @@ sending touch-on-write metadata.
 
 A managed deployment that selected this path fails server startup if the QUIC
 transport is unavailable, rather than quietly reverting to direct S3 reads.
+Readiness probes use the same relayed read path with a valid raw key; they do
+not issue a direct S3 download. Write-permission probes remain direct S3 writes.
 
 Cache stores without the managed S3 backend, without the metadata credentials,
 or on a dist client without `quic = true` keep their existing behavior.

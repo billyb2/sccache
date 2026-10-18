@@ -433,8 +433,18 @@ impl Storage for RemoteStorage {
 
         let path = ".sccache_check";
 
-        // Read is required, return error directly if we can't read .
-        match self.operator.read(path).await {
+        // Managed cache reads, including readiness, must use the selected
+        // transport. The probe is a valid raw cache key, not the S3 marker path.
+        #[cfg(all(feature = "s3", feature = "dist-client"))]
+        let read_check = match &self.relay_reader {
+            Some(reader) => self
+                .read_relayed(reader, "0000000000000000000000000000000000000000000000000000000000000000")
+                .await,
+            None => self.operator.read(path).await,
+        };
+        #[cfg(not(all(feature = "s3", feature = "dist-client")))]
+        let read_check = self.operator.read(path).await;
+        match read_check {
             Ok(_) => (),
             // Read not exist file with not found is ok.
             Err(err) if err.kind() == ErrorKind::NotFound => (),
@@ -1252,6 +1262,32 @@ mod test {
             assert!(runtime
                 .block_on(chain.get("0123456789abcdef0123456789abcdef"))
                 .is_err());
+        }
+
+        #[test]
+        fn readonly_readiness_uses_the_gateway_and_fails_closed() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            for available in [true, false] {
+                let outcome = if available {
+                    Ok(RelayOutcome::Miss)
+                } else {
+                    Err("gateway unavailable".to_owned())
+                };
+                let (_fake, mut storage) = storage(outcome);
+                storage.rw_mode = CacheMode::ReadOnly;
+                storage.skip_cache_check = false;
+                // Direct S3 points at an unreachable loopback port. A missing
+                // probe object still proves readability through the gateway.
+                let checked = runtime.block_on(storage.check());
+                if available {
+                    assert_eq!(checked.expect("readable cache"), CacheMode::ReadOnly);
+                } else {
+                    assert!(checked.is_err(), "unavailable relay cannot pass readiness");
+                }
+            }
         }
 
         #[test]
