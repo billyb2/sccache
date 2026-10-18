@@ -29,8 +29,14 @@ use crate::cache::multilevel::{MultiLevelStats, MultiLevelStorage};
 use crate::cache::oss::OSSCache;
 #[cfg(feature = "redis")]
 use crate::cache::redis::RedisCache;
+#[cfg(all(feature = "s3", feature = "dist-client"))]
+#[cfg(all(feature = "s3", feature = "dist-client"))]
+use crate::cache::relay::RelayOutcome;
+use crate::cache::relay::RelayReader;
 #[cfg(feature = "s3")]
 use crate::cache::s3::S3Cache;
+#[cfg(all(feature = "s3", feature = "dist-client"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(
     feature = "azure",
     feature = "gcs",
@@ -68,6 +74,22 @@ pub enum GetPathResult {
     Miss,
     /// This backend does not support direct file access; use `get`/`get_raw` instead.
     Unsupported,
+}
+
+/// Build the billdfaster metadata integration for one S3 namespace.
+///
+/// Both `SCCACHE_BILLDFASTER_TOUCH_ENDPOINT` and
+/// `SCCACHE_BILLDFASTER_TOUCH_TOKEN` must be configured; otherwise the
+/// integration is off and upstream behavior is unchanged. The namespace is
+/// the cache's own configured S3 key prefix.
+#[cfg(feature = "s3")]
+pub fn billdfaster_touch_client(
+    namespace: String,
+) -> Option<crate::cache::billdfaster_touch::TouchClient> {
+    let endpoint = std::env::var("SCCACHE_BILLDFASTER_TOUCH_ENDPOINT").ok();
+    let token = std::env::var("SCCACHE_BILLDFASTER_TOUCH_TOKEN").ok();
+    crate::cache::billdfaster_touch::TouchConfig::from_parts(endpoint, token, namespace)
+        .map(crate::cache::billdfaster_touch::TouchClient::new)
 }
 
 /// An interface to cache storage.
@@ -202,6 +224,13 @@ pub trait Storage: Send + Sync {
     fn billdfaster_touch_stats(&self) -> (u64, u64) {
         (0, 0)
     }
+
+    /// billdfaster relayed-read diagnostics:
+    /// `(relayed hits, relayed failures)`. Misses are not failures. Backends
+    /// without the integration report `(0, 0)`.
+    fn billdfaster_relay_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// Wrapper for opendal::Operator that adds basedirs support
@@ -225,6 +254,17 @@ pub struct RemoteStorage {
     /// (the default) preserves exact upstream behavior.
     #[cfg(feature = "s3")]
     touch_client: Option<crate::cache::billdfaster_touch::TouchClient>,
+    /// Optional billdfaster relayed reader. When set (managed S3 cache with
+    /// `[dist] quic = true`), result-object reads travel through the gateway
+    /// over the shared dist QUIC connection instead of a direct S3 GET, and
+    /// the gateway performs the last-use touch, so reads never touch S3
+    /// directly and never send a second HTTP touch. Writes are unchanged.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    relay_reader: Option<RelayReader>,
+    /// Relayed-read diagnostics: `(hits, failures)`. A relayed miss is not a
+    /// failure. Both stay zero without a relayed reader.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    relay_stats: RelayStats,
 }
 
 #[cfg(any(
@@ -247,6 +287,10 @@ impl RemoteStorage {
             skip_cache_check: false,
             #[cfg(feature = "s3")]
             touch_client: None,
+            #[cfg(all(feature = "s3", feature = "dist-client"))]
+            relay_reader: None,
+            #[cfg(all(feature = "s3", feature = "dist-client"))]
+            relay_stats: RelayStats::default(),
         }
     }
 
@@ -262,12 +306,27 @@ impl RemoteStorage {
         self
     }
 
+    /// Route result-object reads through the billdfaster gateway.
+    ///
+    /// The gateway performs the durable last-use touch for each read, so a
+    /// relayed read must not also issue the direct HTTP touch. Writes keep
+    /// their existing touch-on-write behavior.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    pub fn with_relay_reader(mut self, relay_reader: RelayReader) -> Self {
+        self.relay_reader = Some(relay_reader);
+        self
+    }
+
     pub fn with_skip_cache_check(mut self, skip_cache_check: bool) -> Self {
         self.skip_cache_check = skip_cache_check;
         self
     }
 
     async fn read_with_touch(&self, key: &str) -> opendal::Result<opendal::Buffer> {
+        #[cfg(all(feature = "s3", feature = "dist-client"))]
+        if let Some(reader) = &self.relay_reader {
+            return self.read_relayed(reader, key).await;
+        }
         let key = normalize_key(key);
         #[cfg(feature = "s3")]
         if let Some(touch) = &self.touch_client {
@@ -280,6 +339,35 @@ impl RemoteStorage {
                 .await;
         }
         self.operator.read(&key).await
+    }
+
+    /// One relayed read. `key` is the raw, unsharded cache key: the gateway
+    /// applies the canonical S3 shard path itself.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    async fn read_relayed(
+        &self,
+        reader: &RelayReader,
+        key: &str,
+    ) -> opendal::Result<opendal::Buffer> {
+        match reader.read(key).await {
+            Ok(RelayOutcome::Hit { data, .. }) => {
+                self.relay_stats.record_hit();
+                Ok(opendal::Buffer::from(data))
+            }
+            Ok(RelayOutcome::Miss) => Err(opendal::Error::new(
+                opendal::ErrorKind::NotFound,
+                "relayed cache miss",
+            )),
+            Err(error) => {
+                self.relay_stats.record_failure();
+                // Surface the failure exactly like any other unexpected
+                // backend error. It is never turned into a direct S3 read.
+                Err(opendal::Error::new(
+                    opendal::ErrorKind::Unexpected,
+                    error.to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -304,12 +392,21 @@ impl Storage for RemoteStorage {
     async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {
         match self.read_with_touch(key).await {
             Ok(res) => {
+                // One owned buffer: the decode reads it in place and the
+                // multilevel backfill takes the same bytes by refcount.
                 let data = res.to_bytes();
                 let hit = CacheRead::from(io::Cursor::new(data.clone()))?;
                 Ok((Cache::Hit(hit), Some(data)))
             }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok((Cache::Miss, None)),
             Err(e) => {
+                #[cfg(all(feature = "s3", feature = "dist-client"))]
+                if self.relay_reader.is_some() {
+                    // A relayed read that failed is a cache failure, reported
+                    // as such. It is never downgraded to a miss, so nothing
+                    // downstream can retry it against S3 directly.
+                    return Err(anyhow!("Failed to read raw bytes: {:?}", e));
+                }
                 warn!("Got unexpected error: {:?}", e);
                 Ok((Cache::Miss, None))
             }
@@ -485,10 +582,44 @@ impl Storage for RemoteStorage {
             None => (0, 0),
         }
     }
+
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    fn billdfaster_relay_stats(&self) -> (u64, u64) {
+        self.relay_stats.snapshot()
+    }
+}
+
+/// Relayed-read counters.
+#[cfg(all(feature = "s3", feature = "dist-client"))]
+#[derive(Default, Debug)]
+pub struct RelayStats {
+    hits: AtomicU64,
+    failures: AtomicU64,
+}
+
+#[cfg(all(feature = "s3", feature = "dist-client"))]
+impl RelayStats {
+    fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.failures.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// Build a single cache storage from CacheType
 /// Helper function used by storage_from_config for both single and multi-level caches
+///
+/// `relay_reader` is the billdfaster relayed result-cache reader. It is only
+/// used by the managed S3 backend; every other backend ignores it.
 #[cfg(any(
     feature = "azure",
     feature = "gcs",
@@ -505,6 +636,11 @@ pub fn build_single_cache(
     basedirs: &[Vec<u8>],
     _pool: &tokio::runtime::Handle,
     skip_cache_check: bool,
+    #[cfg_attr(
+        not(all(feature = "s3", feature = "dist-client")),
+        allow(unused_variables)
+    )]
+    relay_reader: Option<RelayReader>,
 ) -> Result<Arc<dyn Storage>> {
     match cache_type {
         #[cfg(feature = "azure")]
@@ -664,23 +800,29 @@ pub fn build_single_cache(
             // key prefix (already trailing-slash-trimmed by upstream
             // configuration parsing), never a separately guessed
             // environment read.
-            let touch_endpoint = std::env::var("SCCACHE_BILLDFASTER_TOUCH_ENDPOINT").ok();
-            let touch_token = std::env::var("SCCACHE_BILLDFASTER_TOUCH_TOKEN").ok();
-            let storage_builder = match crate::cache::billdfaster_touch::TouchConfig::from_parts(
-                touch_endpoint,
-                touch_token,
-                c.key_prefix.clone(),
-            ) {
+            let storage_builder = match billdfaster_touch_client(c.key_prefix.clone()) {
                 Some(touch_config) => {
                     debug!("billdfaster metadata touch integration enabled");
                     RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
                         .with_skip_cache_check(skip_cache_check)
-                        .with_billdfaster_touch(crate::cache::billdfaster_touch::TouchClient::new(
-                            touch_config,
-                        ))
+                        .with_billdfaster_touch(touch_config)
                 }
                 None => RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
                     .with_skip_cache_check(skip_cache_check),
+            };
+            // A relayed reader replaces the direct read path: the gateway
+            // performs the metadata grant and the origin GET itself, so reads
+            // are never both relayed and touched again over HTTP.
+            #[cfg(feature = "dist-client")]
+            let storage_builder = match relay_reader {
+                Some(reader) => {
+                    debug!(
+                        "billdfaster relayed result-cache reads enabled for namespace {}",
+                        c.key_prefix
+                    );
+                    storage_builder.with_relay_reader(reader)
+                }
+                None => storage_builder,
             };
             Ok(Arc::new(storage_builder))
         }
@@ -743,12 +885,21 @@ pub fn build_single_cache(
 
 /// Get a suitable `Storage` implementation from configuration.
 /// Supports both single-cache (backward compatible) and multi-level cache configurations.
+///
+/// `relay_reader` selects billdfaster relayed result-cache reads for the
+/// managed S3 backend; it is forwarded to every configured level so a
+/// multilevel chain whose S3 level is reached reads through the gateway too.
 pub fn storage_from_config(
     config: &Config,
     pool: &tokio::runtime::Handle,
+    #[cfg_attr(
+        not(all(feature = "s3", feature = "dist-client")),
+        allow(unused_variables)
+    )]
+    relay_reader: Option<RelayReader>,
 ) -> Result<Arc<dyn Storage>> {
     // Check for multi-level cache configuration
-    if let Some(multilevel) = MultiLevelStorage::from_config(config, pool)? {
+    if let Some(multilevel) = MultiLevelStorage::from_config(config, pool, relay_reader.clone())? {
         return Ok(Arc::new(multilevel));
     }
 
@@ -766,7 +917,13 @@ pub fn storage_from_config(
     ))]
     if let Some(cache_type) = &config.cache {
         debug!("Configuring single cache from CacheType");
-        return build_single_cache(cache_type, &config.basedirs, pool, config.skip_cache_check);
+        return build_single_cache(
+            cache_type,
+            &config.basedirs,
+            pool,
+            config.skip_cache_check,
+            relay_reader,
+        );
     }
 
     // No remote cache configured - use disk cache only
@@ -818,7 +975,7 @@ mod test {
         config.fallback_cache.rw_mode = CacheModeConfig::ReadWrite;
 
         {
-            let cache = storage_from_config(&config, runtime.handle()).unwrap();
+            let cache = storage_from_config(&config, runtime.handle(), None).unwrap();
 
             runtime.block_on(async move {
                 cache.put("test1", CacheWrite::default()).await.unwrap();
@@ -833,7 +990,7 @@ mod test {
         config.fallback_cache.rw_mode = CacheModeConfig::ReadOnly;
 
         {
-            let cache = storage_from_config(&config, runtime.handle()).unwrap();
+            let cache = storage_from_config(&config, runtime.handle(), None).unwrap();
 
             runtime.block_on(async move {
                 assert_eq!(
@@ -912,7 +1069,7 @@ mod test {
                 ..Default::default()
             };
 
-            let storage = storage_from_config(&single_cache_config, runtime.handle()).unwrap();
+            let storage = storage_from_config(&single_cache_config, runtime.handle(), None).unwrap();
             assert_eq!(runtime.block_on(storage.check()).unwrap(), expected_mode);
 
             let multilevel_config = Config {
@@ -928,7 +1085,7 @@ mod test {
                 ..Default::default()
             };
 
-            let storage = storage_from_config(&multilevel_config, runtime.handle()).unwrap();
+            let storage = storage_from_config(&multilevel_config, runtime.handle(), None).unwrap();
             assert_eq!(runtime.block_on(storage.check()).unwrap(), expected_mode);
         }
     }
@@ -955,6 +1112,176 @@ mod test {
         // Verify basedirs work
         assert_eq!(storage.basedirs(), basedirs.as_slice());
         assert_eq!(storage.basedirs().len(), 1);
+    }
+
+    /// Storage-level relayed-read semantics: the consumer sees a hit, a miss
+    /// or an error, but the S3 operator is never read and no second touch is
+    /// issued.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    mod relayed_reads {
+        use super::*;
+        use crate::cache::relay::{CacheReadTransport, RelayOutcome, RelayReader};
+        use crate::dist::quic::{Request, Response};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct Fake {
+            outcome: Mutex<Option<std::result::Result<RelayOutcome, String>>>,
+            requests: Mutex<Vec<Request>>,
+        }
+
+        #[async_trait]
+        impl CacheReadTransport for Fake {
+            async fn request(&self, request: Request) -> Result<Response> {
+                self.requests.lock().push(request);
+                match self.outcome.lock().take().expect("one read per test") {
+                    Ok(RelayOutcome::Hit { data, object_len }) => Ok(Response {
+                        status: 200,
+                        body: {
+                            let mut body = object_len.to_be_bytes().to_vec();
+                            body.extend_from_slice(&data);
+                            body
+                        },
+                    }),
+                    Ok(RelayOutcome::Miss) => Ok(Response {
+                        status: 404,
+                        body: Vec::new(),
+                    }),
+                    Err(message) => Err(anyhow!(message)),
+                }
+            }
+        }
+
+        fn storage(outcome: std::result::Result<RelayOutcome, String>) -> (Arc<Fake>, RemoteStorage) {
+            let fake = Arc::new(Fake {
+                outcome: Mutex::new(Some(outcome)),
+                requests: Mutex::new(Vec::new()),
+            });
+            let reader = RelayReader::new(
+                Arc::clone(&fake) as Arc<dyn CacheReadTransport>,
+                "billdfaster/v1".to_owned(),
+                "metadata-token".to_owned(),
+            );
+            let operator = crate::cache::s3::S3Cache::new(
+                "bucket".to_owned(),
+                "billdfaster/v1".to_owned(),
+                true,
+            )
+            .with_region(Some("us-east-1".to_owned()))
+            .with_endpoint(Some("http://127.0.0.1:9".to_owned()))
+            .with_use_ssl(Some(false))
+            .build()
+            .expect("operator");
+            let storage =
+                RemoteStorage::new(operator, vec![], CacheMode::ReadWrite).with_relay_reader(reader);
+            (fake, storage)
+        }
+
+        fn entry_bytes() -> Vec<u8> {
+            CacheWrite::default().finish().expect("cache entry").into()
+        }
+
+        #[test]
+        fn hit_comes_from_the_gateway_with_the_raw_key() {
+            let data = entry_bytes();
+            let (fake, storage) = storage(Ok(RelayOutcome::Hit {
+                data: data.clone().into(),
+                object_len: data.len() as u64,
+            }));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (cache, raw) = runtime
+                .block_on(async { storage.get_with_raw("0123456789abcdef0123456789abcdef").await })
+                .expect("relayed hit");
+            assert!(matches!(cache, Cache::Hit(_)));
+            assert_eq!(raw.expect("raw bytes").as_ref(), data.as_slice());
+            assert_eq!(storage.billdfaster_relay_stats(), (1, 0));
+
+            let requests = fake.requests.lock();
+            assert_eq!(requests[0].path, "/v1/cache/read");
+            let body = match &requests[0].body {
+                crate::dist::quic::Body::Bytes(body) => String::from_utf8(body.clone()).unwrap(),
+                _ => panic!("expected an in-memory body"),
+            };
+            assert_eq!(
+                body,
+                r#"{"namespace":"billdfaster/v1","key":"0123456789abcdef0123456789abcdef"}"#
+            );
+        }
+
+        #[test]
+        fn relayed_level_failure_stops_the_chain_instead_of_falling_through() {
+            // A later level would happily answer a miss, so the relayed
+            // level's failure must not be downgraded to one.
+            let (_fake, relayed) = storage(Err("gateway unavailable".to_owned()));
+            struct AlwaysHit;
+            #[async_trait]
+            impl Storage for AlwaysHit {
+                async fn get(&self, _key: &str) -> Result<Cache> {
+                    Ok(Cache::Hit(CacheRead::from(io::Cursor::new(entry_bytes()))?))
+                }
+                async fn put(&self, _key: &str, _entry: CacheWrite) -> Result<Duration> {
+                    Ok(Duration::default())
+                }
+                async fn check(&self) -> Result<CacheMode> {
+                    Ok(CacheMode::ReadWrite)
+                }
+                fn location(&self) -> String {
+                    "later-level".to_owned()
+                }
+                async fn current_size(&self) -> Result<Option<u64>> {
+                    Ok(None)
+                }
+                async fn max_size(&self) -> Result<Option<u64>> {
+                    Ok(None)
+                }
+            }
+            let later = Arc::new(AlwaysHit);
+            let mut chain = crate::cache::multilevel::MultiLevelStorage::new(vec![
+                Arc::new(relayed) as Arc<dyn Storage>,
+                later,
+            ]);
+            chain.set_relayed_levels(vec![true, false]);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert!(runtime
+                .block_on(chain.get("0123456789abcdef0123456789abcdef"))
+                .is_err());
+        }
+
+        #[test]
+        fn missing_object_is_a_miss() {
+            let (_fake, storage) = storage(Ok(RelayOutcome::Miss));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let cache = runtime
+                .block_on(storage.get("0123456789abcdef0123456789abcdef"))
+                .expect("miss");
+            assert!(matches!(cache, Cache::Miss));
+            assert_eq!(storage.billdfaster_relay_stats(), (0, 0));
+        }
+
+        #[test]
+        fn relayed_failure_is_a_cache_error_not_a_miss() {
+            let (_fake, storage) = storage(Err("gateway unavailable".to_owned()));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // A failure must not look like a miss: nothing may retry it
+            // elsewhere, and no direct S3 read is attempted.
+            assert!(runtime
+                .block_on(storage.get("0123456789abcdef0123456789abcdef"))
+                .is_err());
+            assert_eq!(storage.billdfaster_relay_stats(), (0, 1));
+        }
     }
 
     #[test]

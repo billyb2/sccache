@@ -349,6 +349,9 @@ pub struct MultiLevelStorage {
     atomic_stats: Vec<Arc<AtomicLevelStats>>,
     /// Base directories for path normalization, propagated to compiler pipeline
     basedirs: Vec<Vec<u8>>,
+    /// Which levels read through the billdfaster gateway. A failure on such a
+    /// level stops the chain instead of looking like a miss.
+    relayed_levels: Vec<bool>,
 }
 
 impl MultiLevelStorage {
@@ -380,13 +383,23 @@ impl MultiLevelStorage {
     ) -> Self {
         let atomic_stats = AtomicLevelStats::from_levels(&levels);
         let basedirs = Self::collect_basedirs(&levels);
+        let relayed_levels = vec![false; levels.len()];
 
         MultiLevelStorage {
             levels,
             write_error_policy,
             atomic_stats,
             basedirs,
+            relayed_levels,
         }
+    }
+
+    /// Mark which levels read through the billdfaster gateway (`true` at the
+    /// level's index). Relayed levels fail the whole chain on a read error
+    /// rather than being skipped like an ordinary unavailable backend.
+    pub(crate) fn set_relayed_levels(&mut self, relayed_levels: Vec<bool>) {
+        debug_assert_eq!(relayed_levels.len(), self.levels.len());
+        self.relayed_levels = relayed_levels;
     }
 
     /// Get a snapshot of current multi-level cache statistics.
@@ -402,7 +415,18 @@ impl MultiLevelStorage {
     /// Each level specified in config.cache_configs.multilevel.chain must have its
     /// corresponding configuration present (e.g., SCCACHE_DIR for disk,
     /// SCCACHE_REDIS_ENDPOINT for redis, etc).
-    pub fn from_config(config: &Config, pool: &tokio::runtime::Handle) -> Result<Option<Self>> {
+    ///
+    /// `relay_reader` is forwarded to every level, so an S3 level anywhere in
+    /// the chain reads its result objects through the billdfaster gateway.
+    pub fn from_config(
+        config: &Config,
+        pool: &tokio::runtime::Handle,
+        #[cfg_attr(
+            not(all(feature = "s3", feature = "dist-client")),
+            allow(unused_variables)
+        )]
+        relay_reader: Option<crate::cache::relay::RelayReader>,
+    ) -> Result<Option<Self>> {
         let ml_config = match config.cache_configs.multilevel.as_ref() {
             Some(cfg) if !cfg.chain.is_empty() => cfg,
             _ => return Ok(None),
@@ -417,6 +441,7 @@ impl MultiLevelStorage {
         let write_error_policy = ml_config.write_error_policy;
 
         let mut storages: Vec<Arc<dyn Storage>> = Vec::new();
+        let mut relayed_levels: Vec<bool> = Vec::new();
 
         // Build caches in the exact order specified in levels
         for level_name in levels {
@@ -442,6 +467,7 @@ impl MultiLevelStorage {
                     config.basedirs.clone(),
                 ));
                 storages.push(disk_storage);
+                relayed_levels.push(false);
                 trace!("Added disk cache level");
             } else {
                 // Build remote cache - get the appropriate CacheType
@@ -533,10 +559,19 @@ impl MultiLevelStorage {
                             &config.basedirs,
                             pool,
                             config.skip_cache_check,
+                            relay_reader.clone(),
                         )
                         .with_context(|| {
                             format!("Failed to build cache for level '{}'", level_name)
                         })?;
+                        // Only the managed S3 level can be relayed; the
+                        // reader is ignored by every other backend.
+                        #[cfg(feature = "s3")]
+                        let relayed =
+                            relay_reader.is_some() && matches!(cache_type, CacheType::S3(_));
+                        #[cfg(not(feature = "s3"))]
+                        let relayed = false;
+                        relayed_levels.push(relayed);
                         storages.push(storage);
                         trace!("Added cache level: {}", level_name);
                     } else {
@@ -578,10 +613,10 @@ impl MultiLevelStorage {
             storages.len()
         );
 
-        Ok(Some(MultiLevelStorage::with_write_error_policy(
-            storages,
-            write_error_policy,
-        )))
+        debug_assert_eq!(relayed_levels.len(), storages.len());
+        let mut storage = MultiLevelStorage::with_write_error_policy(storages, write_error_policy);
+        storage.set_relayed_levels(relayed_levels);
+        Ok(Some(storage))
     }
 
     /// Helper to write cache entry from raw bytes.
@@ -737,6 +772,15 @@ impl Storage for MultiLevelStorage {
                     return Ok(other);
                 }
                 Err(e) => {
+                    // A relayed level already failed its lookup through the
+                    // gateway. Falling through to a later level here would
+                    // turn a gateway/cache failure into an apparent miss and
+                    // let another backend answer for it, so the error stops
+                    // the chain instead.
+                    if self.relayed_levels[idx] {
+                        warn!("Error checking relayed cache level {}: {}", idx, e);
+                        return Err(e);
+                    }
                     warn!(
                         "Error checking cache level {}: {}, trying next level",
                         idx, e
@@ -753,6 +797,21 @@ impl Storage for MultiLevelStorage {
         }
 
         Ok(Cache::Miss)
+    }
+
+    /// Relayed reads for this chain: sum of each level's counters.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    fn billdfaster_relay_stats(&self) -> (u64, u64) {
+        let mut hits = 0;
+        let mut failures = 0;
+        for (idx, level) in self.levels.iter().enumerate() {
+            if self.relayed_levels.get(idx).copied().unwrap_or(false) {
+                let (level_hits, level_failures) = level.billdfaster_relay_stats();
+                hits += level_hits;
+                failures += level_failures;
+            }
+        }
+        (hits, failures)
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {

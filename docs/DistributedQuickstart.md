@@ -159,8 +159,43 @@ address left in the scheduler hostname's DNS answers.
 The client obtains the gateway certificate through authenticated HTTPS
 `GET /v1/quic`, pins that certificate, and still verifies the TLS server name.
 Only read-only scheduler GETs may use resumed 0-RTT. Allocation, toolchain
-submission, and compilation wait for handshake confirmation; mutations are not
-automatically retried and QUIC failure never silently switches to HTTP.
+submission, compilation and result-cache reads wait for handshake confirmation;
+mutations are not automatically retried and QUIC failure never silently
+switches to HTTP.
+
+### Relayed result-cache reads
+
+The billdfaster revision also lets the client read its managed S3 result cache
+through the gateway instead of downloading directly from Tigris. There is no
+separate switch: it is active whenever the managed S3 cache is configured (the
+`SCCACHE_BILLDFASTER_TOUCH_ENDPOINT` and `SCCACHE_BILLDFASTER_TOUCH_TOKEN`
+metadata integration) and `[dist] quic = true`.
+
+Each lookup is one `POST /v1/cache/read` on a new bidirectional stream of the
+existing QUIC connection, so cache traffic and compiler RPCs share one
+endpoint, TLS session store and connection — the same transport is retained
+when the dist client is recreated after a configuration error, so a recreation
+never strands cache reads on a stale connection or opens a second endpoint.
+The request body is exactly
+`{"namespace": "<S3 key prefix>", "key": "<raw cache key>"}`; the gateway
+applies the cache's own S3 shard path. The gateway performs the durable
+last-use metadata touch (so relayed reads send no second HTTP touch) and reads
+the object from the origin once. The response is the usual 2-byte status
+followed, for `200`, by an 8-byte big-endian object length and exactly those
+bytes.
+
+Because the lookup touches durable metadata, it is a mutation: it never uses
+0-RTT early data and is never retried. `404` is an ordinary cache miss, bounded
+by the same 60 s deadline as the rest of the lookup. Any other status, and any
+truncated, overlong or malformed response, is a cache failure: it is reported
+as such and never falls back to a direct S3 read. Writes are unchanged and keep
+sending touch-on-write metadata.
+
+A managed deployment that selected this path fails server startup if the QUIC
+transport is unavailable, rather than quietly reverting to direct S3 reads.
+
+Cache stores without the managed S3 backend, without the metadata credentials,
+or on a dist client without `quic = true` keep their existing behavior.
 
 Using custom toolchains
 -----------------------

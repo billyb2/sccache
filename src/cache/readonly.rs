@@ -48,6 +48,15 @@ impl Storage for ReadOnlyStorage {
         Ok(CacheMode::ReadOnly)
     }
 
+    #[cfg(feature = "s3")]
+    fn billdfaster_touch_stats(&self) -> (u64, u64) {
+        self.0.billdfaster_touch_stats()
+    }
+
+    fn billdfaster_relay_stats(&self) -> (u64, u64) {
+        self.0.billdfaster_relay_stats()
+    }
+
     /// Get the storage location.
     fn location(&self) -> String {
         self.0.location()

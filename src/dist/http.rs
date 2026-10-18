@@ -1312,7 +1312,7 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
-            quic: bool,
+            quic: Option<Arc<quic::QuicClient>>,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
@@ -1332,18 +1332,12 @@ mod client {
             let client_toolchains =
                 cache::ClientToolchains::new(cache_dir, cache_size, toolchain_configs)
                     .context("failed to initialise client toolchains")?;
-            let quic = if quic {
+            if quic.is_some() {
                 info!(
                     "Distributed transport over QUIC is enabled for {}",
                     scheduler_url
                 );
-                Some(Arc::new(quic::QuicClient::new(
-                    scheduler_url.clone(),
-                    auth_token.clone(),
-                )))
-            } else {
-                None
-            };
+            }
             Ok(Self {
                 auth_token,
                 scheduler_url,
@@ -1572,6 +1566,11 @@ mod client {
 
     #[async_trait]
     impl dist::Client for Client {
+        #[cfg(feature = "s3")]
+        fn as_quic_transport(&self) -> Option<Arc<quic::QuicClient>> {
+            self.quic.clone()
+        }
+
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let client = self.client.clone();
             let server_certs = self.server_certs.clone();
@@ -1971,7 +1970,7 @@ mod client {
                 &[],
                 "test".into(),
                 false,
-                false,
+                None,
             )
             .unwrap();
             for _ in 0..2 {
@@ -2159,7 +2158,10 @@ mod client {
                 &[],
                 "scheduler-token".into(),
                 false,
-                true,
+                Some(Arc::new(quic::QuicClient::new(
+                    reqwest::Url::parse("https://localhost").unwrap(),
+                    "scheduler-token".into(),
+                ))),
             )
             .unwrap();
             assert!(client.quic.is_some(), "QUIC transport was not selected");
@@ -2303,7 +2305,7 @@ mod client {
                 &[],
                 "scheduler-token".into(),
                 false,
-                false,
+                None,
             )
             .unwrap();
 
@@ -2361,7 +2363,10 @@ mod client {
                 &[],
                 "scheduler-token".into(),
                 false,
-                true,
+                Some(Arc::new(quic::QuicClient::new(
+                    reqwest::Url::parse("https://localhost").unwrap(),
+                    "scheduler-token".into(),
+                ))),
             )
             .unwrap();
             assert!(client.quic.is_some(), "QUIC transport was not selected");

@@ -34,9 +34,14 @@
 //! - Only the read-only scheduler GETs (`status`, `server_certificate`) are
 //!   ever attempted as 0-RTT early data, and a rejected early attempt is
 //!   retried exactly once after the handshake completes.
-//! - Mutations (`alloc_job`, `submit_toolchain`, `run_job`) are written only
-//!   after the handshake is confirmed and are never retried, replayed or
-//!   re-submitted.
+//! - Mutations (`alloc_job`, `submit_toolchain`, `run_job`, `cache/read`) are
+//!   written only after the handshake is confirmed and are never retried,
+//!   replayed or re-submitted.
+//! - `POST /v1/cache/read` is the only non-document scheduler path, it is
+//!   allowlisted by exact path, requires `POST` plus a metadata bearer, caps
+//!   its body at 2048 bytes and its response at the 8 GiB artifact bound plus
+//!   the 8-byte length prefix. It carries only `{"namespace","key"}`: no
+//!   arbitrary path, key or URL can be expressed.
 //! - Nothing falls back to HTTP after a QUIC failure.
 //!
 //! Resource policy: one endpoint per client, at most 64 concurrent
@@ -74,6 +79,15 @@ const WORKER_BODY_CAP: u64 = 8 * 1024 * 1024 * 1024;
 /// encoder; worker replies share the transport's 8 GiB cap.
 const SCHEDULER_RESPONSE_CAP: u64 = 1024 * 1024;
 const WORKER_RESPONSE_CAP: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Relayed result-cache reads. The only scheduler POST path allowed besides the
+/// document paths, with its own exact body cap and its own bounded response:
+/// an 8-byte big-endian object length plus at most the 8 GiB artifact bound.
+/// The path is a mutation at the origin (durable last-use metadata touch), so
+/// it is never 0-RTT and never retried.
+pub const CACHE_READ_PATH: &str = "/v1/cache/read";
+pub const CACHE_READ_MAX_REQUEST_BYTES: u64 = 2048;
+pub const CACHE_READ_MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024 * 1024 + 8;
 
 /// Discovery bounds: verified HTTPS, no proxy, bounded response.
 const DISCOVERY_RESPONSE_CAP: usize = 16 * 1024;
@@ -189,6 +203,12 @@ impl Request {
     /// use 0-RTT early data.
     fn is_read_only(&self) -> bool {
         self.method == Method::Get && self.target.is_none()
+    }
+
+    /// Test hook: the 0-RTT eligibility verdict for this request.
+    #[cfg(test)]
+    pub(crate) fn is_read_only_for_test(&self) -> bool {
+        self.is_read_only()
     }
 }
 
@@ -321,18 +341,27 @@ impl QuicClient {
         }
     }
 
+    /// The response cap for one validated request.
+    fn response_cap(&self, request: &Request) -> u64 {
+        match request.target {
+            Some(_) => WORKER_RESPONSE_CAP,
+            None if request.path == CACHE_READ_PATH => CACHE_READ_MAX_RESPONSE_BYTES,
+            None => SCHEDULER_RESPONSE_CAP,
+        }
+    }
+
     async fn request_inner(&self, mut request: Request) -> Result<Response> {
         self.validate(&request)?;
         let state = self.state().await?;
         self.counters.requests_sent.fetch_add(1, Ordering::Relaxed);
         if let Some(connection) = state.live_connection().await {
-            return Self::round_trip(&connection, &self.auth_token, &mut request).await;
+            return self.round_trip(&connection, &mut request).await;
         }
         if request.is_read_only() {
             return self.connect_read_only(&state, &mut request).await;
         }
         let connection = self.connect_handshaked(&state).await?;
-        Self::round_trip(&connection, &self.auth_token, &mut request).await
+        self.round_trip(&connection, &mut request).await
     }
 
     /// Validate everything the gateway would reject anyway, before a stream is
@@ -353,6 +382,33 @@ impl QuicClient {
             bail!("scheduler client token is empty or too long for QUIC");
         }
         match request.target {
+            None if path == CACHE_READ_PATH => {
+                // One allowlisted cache path, POST only, and only with the
+                // exact small JSON shape the gateway accepts. Arbitrary
+                // paths, keys and URLs are unusable through this route.
+                if request.method != Method::Post {
+                    bail!("cache read QUIC requests must be POST");
+                }
+                if request.body.len() > CACHE_READ_MAX_REQUEST_BYTES {
+                    bail!(
+                        "cache read QUIC request body of {} bytes exceeds the {} byte cap",
+                        request.body.len(),
+                        CACHE_READ_MAX_REQUEST_BYTES
+                    );
+                }
+                let authorization = request
+                    .authorization
+                    .as_deref()
+                    .context("cache read QUIC requests require a metadata bearer")?;
+                if authorization.len() > MAX_AUTHORIZATION_BYTES
+                    || !authorization.starts_with("Bearer ")
+                    || authorization
+                        .bytes()
+                        .any(|byte| byte < 0x20 || byte == 0x7f)
+                {
+                    bail!("cache read QUIC metadata bearer is malformed");
+                }
+            }
             None => {
                 if request.body.len() > SCHEDULER_BODY_CAP {
                     bail!(
@@ -574,11 +630,11 @@ impl QuicClient {
     /// handshake completes; every other error is returned as-is.
     async fn connect_read_only(&self, state: &State, request: &mut Request) -> Result<Response> {
         if let Some(connection) = state.live_connection().await {
-            return Self::round_trip(&connection, &self.auth_token, request).await;
+            return self.round_trip(&connection, request).await;
         }
         let _guard = state.connect_lock.lock().await;
         if let Some(connection) = state.live_connection().await {
-            return Self::round_trip(&connection, &self.auth_token, request).await;
+            return self.round_trip(&connection, request).await;
         }
         let connecting = state.start_connect()?;
         match connecting.into_0rtt() {
@@ -612,7 +668,7 @@ impl QuicClient {
                     (verdict.ok(), published)
                 };
                 let (result, (verdict, published)) = futures::join!(
-                    Self::round_trip(&connection, &self.auth_token, request),
+                    self.round_trip(&connection, request),
                     publish
                 );
                 if verdict.is_none() {
@@ -654,7 +710,7 @@ impl QuicClient {
                             // fresh, fully protected stream; a mutation would
                             // never reach this path.
                             let response =
-                                Self::round_trip(&connection, &self.auth_token, request).await?;
+                                self.round_trip(&connection, request).await?;
                             if !published {
                                 self.publish_connection(state, &connection).await;
                             }
@@ -681,7 +737,7 @@ impl QuicClient {
                 // The connection is confirmed and stored; other requests may
                 // use it in parallel with this round trip.
                 drop(_guard);
-                Self::round_trip(&connection, &self.auth_token, request).await
+                self.round_trip(&connection, request).await
             }
         }
     }
@@ -700,10 +756,11 @@ impl QuicClient {
 
     /// One request/response exchange on a fresh bidirectional stream.
     async fn round_trip(
+        &self,
         connection: &quinn::Connection,
-        client_token: &str,
         request: &mut Request,
     ) -> Result<Response> {
+        let cap = self.response_cap(request);
         let (send, mut recv) = connection
             .open_bi()
             .await
@@ -721,7 +778,7 @@ impl QuicClient {
             target: request.target.map(|addr| addr.to_string()),
             method: request.method.as_str(),
             path: request.path.as_str(),
-            client_token,
+            client_token: &self.auth_token,
             authorization: request.authorization.as_deref(),
             content_length,
         };
@@ -778,15 +835,16 @@ impl QuicClient {
             .await
             .context("failed to read the QUIC response status")?;
         let status = u16::from_be_bytes(status_bytes);
-        let cap = if request.target.is_some() {
-            WORKER_RESPONSE_CAP
-        } else {
-            SCHEDULER_RESPONSE_CAP
+        // A protocol ceiling larger than the host address space still permits
+        // small responses. Bound reads by both limits, including on 32-bit hosts.
+        let limit = usize::try_from(cap).unwrap_or(usize::MAX);
+        let body = match recv.read_to_end(limit).await {
+            Ok(body) => body,
+            Err(error) if error == quinn::ReadToEndError::TooLong => {
+                bail!("QUIC response body exceeds the {cap} byte cap")
+            }
+            Err(error) => return Err(error).context("failed to read the QUIC response body"),
         };
-        let body = recv
-            .read_to_end(read_cap(cap))
-            .await
-            .context("failed to read the QUIC response body")?;
         Ok(Response { status, body })
     }
 
@@ -928,10 +986,6 @@ fn is_loopback_host(url: &reqwest::Url) -> bool {
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
     }
-}
-
-fn read_cap(cap: u64) -> usize {
-    usize::try_from(cap).unwrap_or(usize::MAX)
 }
 
 /// Read a whole response body with a hard cap, used by discovery.
@@ -1553,6 +1607,105 @@ mod tests {
         let response = client.request(status_request()).await.unwrap();
         assert_eq!(response.status, 404);
         assert_eq!(response.body, b"{\"error\":\"unknown route\"}");
+    }
+
+    fn cache_read_request(body: Vec<u8>, authorization: Option<&str>) -> Request {
+        Request {
+            target: None,
+            method: Method::Post,
+            path: CACHE_READ_PATH.to_string(),
+            authorization: authorization.map(str::to_owned),
+            body: Body::Bytes(body),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_read_is_posted_once_without_early_data() {
+        let fixture = Fixture::start().await;
+        let client = client(&fixture);
+        assert!(await_resumption(&client).await, "no session was resumed");
+
+        let body = br#"{"namespace":"billdfaster/v1","key":"0123456789abcdef0123456789abcdef"}"#;
+        client.close_cached_connection().await;
+        let attempts_before = client.stats().zero_rtt_attempts;
+        let response = client
+            .request(cache_read_request(
+                body.to_vec(),
+                Some("Bearer metadata-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            client.stats().zero_rtt_attempts,
+            attempts_before,
+            "a relayed cache read touches durable metadata and must not be replayed"
+        );
+
+        assert_eq!(
+            fixture.request_log().iter().filter(|r| r.path == CACHE_READ_PATH).count(),
+            1,
+            "the metadata-mutating request must be sent exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_read_is_not_retried_after_a_truncated_response() {
+        let fixture = Fixture::start().await;
+        let client = client(&fixture);
+        fixture.set_mode(MODE_RESET_AFTER_STATUS);
+        let body = br#"{"namespace":"billdfaster/v1","key":"0123456789abcdef"}"#;
+        assert!(client.request(cache_read_request(
+            body.to_vec(),
+            Some("Bearer metadata-token"),
+        )).await.is_err());
+        assert_eq!(
+            fixture.request_log().iter().filter(|r| r.path == CACHE_READ_PATH).count(),
+            1,
+            "a failed metadata-mutating request must not be replayed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_read_route_is_narrowly_validated() {
+        let fixture = Fixture::start().await;
+        let client = client(&fixture);
+        let body = br#"{"namespace":"ns","key":"k"}"#.to_vec();
+
+        let mut get = cache_read_request(body.clone(), Some("Bearer metadata-token"));
+        get.method = Method::Get;
+        assert!(client.request(get).await.is_err());
+
+        assert!(
+            client
+                .request(cache_read_request(body.clone(), None))
+                .await
+                .is_err(),
+            "the metadata bearer is required"
+        );
+        assert!(
+            client
+                .request(cache_read_request(
+                    body.clone(),
+                    Some("metadata-token")
+                ))
+                .await
+                .is_err(),
+            "the bearer scheme is required"
+        );
+
+        let oversized = vec![b'x'; CACHE_READ_MAX_REQUEST_BYTES as usize + 1];
+        assert!(
+            client
+                .request(cache_read_request(oversized, Some("Bearer metadata-token")))
+                .await
+                .is_err()
+        );
+
+        // Nothing malformed ever reached the gateway.
+        assert_eq!(fixture.stream_count(), 0);
+        assert!(fixture.request_log().is_empty());
+        assert!(CACHE_READ_MAX_RESPONSE_BYTES > 8 * 1024 * 1024 * 1024);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

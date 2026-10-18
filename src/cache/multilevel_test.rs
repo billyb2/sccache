@@ -589,7 +589,7 @@ fn test_config_validation_invalid_level_name() {
     }
 
     let config = Config::load().unwrap();
-    let result = MultiLevelStorage::from_config(&config, runtime.handle());
+    let result = MultiLevelStorage::from_config(&config, runtime.handle(), None);
 
     // Should error with unknown cache level
     assert!(result.is_err());
@@ -671,7 +671,7 @@ fn test_config_level_not_configured() {
     }
 
     let config = Config::load().unwrap();
-    let result = MultiLevelStorage::from_config(&config, runtime.handle());
+    let result = MultiLevelStorage::from_config(&config, runtime.handle(), None);
 
     // Should error with "not configured" or "requires" (when feature disabled)
     assert!(result.is_err());

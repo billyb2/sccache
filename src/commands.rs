@@ -799,7 +799,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 // anyways, so we can just return (mostly) empty stats directly.
                 Err(_) => {
                     let runtime = new_client_runtime()?;
-                    let storage = storage_from_config(config, runtime.handle()).ok();
+                    let storage = storage_from_config(config, runtime.handle(), None).ok();
                     runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
                 }
             };

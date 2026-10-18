@@ -146,6 +146,92 @@ pub struct DistClientContainer {
     // The actual dist client state
     #[cfg(feature = "dist-client")]
     state: futures::lock::Mutex<DistClientState>,
+    /// The one QUIC transport this server's dist clients share. It is created
+    /// once, retained by the container as well as by every
+    /// [`DistClientConfig`] clone, and never replaced, so relayed cache reads
+    /// keep the exact transport through client recreation. Only the managed
+    /// `s3` cache consumes it; other builds have no reader to hand it to.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    quic_transport: Option<Arc<crate::dist::quic::QuicClient>>,
+}
+
+/// Build the billdfaster relayed result-cache reader when, and only when, the
+/// deployment already selects the managed cache read path:
+///
+/// - the configured cache is the managed S3 cache, so the key namespace and
+///   metadata bearer come from that cache's own touch configuration
+///   (`SCCACHE_BILLDFASTER_TOUCH_ENDPOINT` / `SCCACHE_BILLDFASTER_TOUCH_TOKEN`);
+/// - `[dist] quic = true` selected the shared QUIC transport.
+///
+/// The transport is the server's single [`crate::dist::quic::QuicClient`],
+/// the same `Arc` every dist client built from this server's config uses, so
+/// cache lookups and compiler RPCs share one endpoint, session store and
+/// connection and survive client recreation. This adds no opt-in of its own:
+/// `quic = true` alone activates relayed reads, and every other configuration
+/// (no S3 cache, no touch credentials, non-QUIC dist) keeps exact upstream
+/// behavior.
+///
+/// Returns an error, never `None`, when the deployment selected the relayed
+/// path but its transport is missing: falling back to direct S3 reads would
+/// silently abandon the configured read path.
+#[cfg(all(feature = "s3", feature = "dist-client"))]
+fn relay_reader_for(
+    config: &Config,
+    transport: Option<Arc<crate::dist::quic::QuicClient>>,
+) -> Result<Option<crate::cache::relay::RelayReader>> {
+    if !config.dist.quic {
+        return Ok(None);
+    }
+    // A nonempty multilevel chain replaces the single-cache fallback. Do
+    // not select retained S3 settings when that chain does not use S3.
+    let s3 = match config.cache_configs.multilevel.as_ref() {
+        Some(multilevel) if !multilevel.chain.is_empty() => {
+            if !multilevel.chain.iter().any(|name| name.trim().eq_ignore_ascii_case("s3")) {
+                return Ok(None);
+            }
+            config.cache_configs.s3.as_ref()
+        }
+        _ => match config.cache.as_ref() {
+            Some(config::CacheType::S3(s3)) => Some(s3),
+            _ => None,
+        },
+    };
+    let Some(s3) = s3 else {
+        return Ok(None);
+    };
+    let Some(touch) = crate::cache::cache::billdfaster_touch_client(s3.key_prefix.clone()) else {
+        // No metadata credentials: this deployment does not run the managed
+        // read path at all, so there is nothing to relay.
+        return Ok(None);
+    };
+    let Some(transport) = transport else {
+        bail!(
+            "managed cache with [dist] quic = true requires the QUIC transport; \
+             refusing to fall back to direct S3 reads"
+        );
+    };
+    debug!(
+        "billdfaster relayed cache reads enabled for namespace {}",
+        touch.namespace()
+    );
+    // The reader takes its own handle of the same client: one transport, one
+    // endpoint, no second connection pool.
+    let transport: Arc<dyn crate::cache::relay::CacheReadTransport> = transport;
+    Ok(Some(crate::cache::relay::RelayReader::new(
+        transport,
+        touch.namespace().to_owned(),
+        touch.token().to_owned(),
+    )))
+}
+
+#[cfg(not(all(feature = "s3", feature = "dist-client")))]
+fn relay_reader_for(
+    _config: &Config,
+    _transport: Option<()>,
+) -> Result<Option<crate::cache::relay::RelayReader>> {
+    // Without both features there is no managed relayed read path at all, so
+    // this is not a fallback: the deployment never selected relay.
+    Ok(crate::cache::relay::RelayReader::absent())
 }
 
 #[cfg(feature = "dist-client")]
@@ -161,7 +247,15 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
-    quic: bool,
+    /// `[dist] quic`, retained so the transport is only built when the
+    /// deployment actually selected QUIC.
+    quic_enabled: bool,
+    /// The client's QUIC transport, created once per `SccacheServer` and
+    /// shared by every dist client built from this config, including clients
+    /// recreated after a configuration error. Relayed result-cache reads use
+    /// the same `Arc`, so a recreation never strands them on a dead transport
+    /// and never opens a second endpoint.
+    quic_transport: Option<Arc<crate::dist::quic::QuicClient>>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -218,25 +312,56 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
-            quic: config.dist.quic,
+            quic_enabled: config.dist.quic,
+            // Built once in `create_state`, after the auth token is resolved,
+            // and retained here so every recreation reuses the same `Arc`.
+            quic_transport: None,
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
+        #[cfg(feature = "s3")]
+        let quic_transport = match &state {
+            DistClientState::Some(config, _)
+            | DistClientState::FailWithMessage(config, _)
+            | DistClientState::RetryCreateAt(config, _) => config.quic_transport.clone(),
+            DistClientState::Disabled => None,
+        };
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(feature = "s3")]
+            quic_transport,
         }
+    }
+
+    /// The shared QUIC transport this server's dist clients use, if the
+    /// deployment selected QUIC. This is the transport relayed cache reads
+    /// use, and it is the same `Arc` a recreated dist client receives.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    pub fn quic_transport(&self) -> Option<Arc<crate::dist::quic::QuicClient>> {
+        self.quic_transport.clone()
     }
 
     #[cfg(feature = "dist-client")]
     pub fn new_with_state(state: DistClientState) -> Self {
+        #[cfg(feature = "s3")]
+        let quic_transport = match &state {
+            DistClientState::Some(config, _)
+            | DistClientState::FailWithMessage(config, _)
+            | DistClientState::RetryCreateAt(config, _) => config.quic_transport.clone(),
+            DistClientState::Disabled => None,
+        };
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(feature = "s3")]
+            quic_transport,
         }
     }
 
     pub fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
+            #[cfg(feature = "s3")]
+            quic_transport: None,
         }
     }
 
@@ -329,7 +454,7 @@ impl DistClientContainer {
     }
 
     // Attempt to recreate the dist client
-    async fn create_state(config: DistClientConfig) -> DistClientState {
+    async fn create_state(mut config: DistClientConfig) -> DistClientState {
         macro_rules! try_or_retry_later {
             ($v:expr) => {{
                 match $v {
@@ -377,6 +502,16 @@ impl DistClientContainer {
                     auth_token
                         .context("could not load client auth token, run |sccache --dist-auth|")
                 );
+                // One transport per server: build it the first time the
+                // scheduler address and auth are both known, then retain it on
+                // this config so a recreated client reuses exactly this
+                // `Arc` rather than opening a second endpoint.
+                if config.quic_transport.is_none() && config.quic_enabled {
+                    info!("Distributed transport over QUIC is enabled for {}", url);
+                    config.quic_transport = Some(Arc::new(
+                        crate::dist::quic::QuicClient::new(url.clone(), auth_token.clone()),
+                    ));
+                }
                 let dist_client = dist::http::Client::new(
                     &config.pool,
                     url,
@@ -385,7 +520,7 @@ impl DistClientContainer {
                     &config.toolchains,
                     auth_token,
                     config.rewrite_includes_only,
-                    config.quic,
+                    config.quic_transport.clone(),
                 );
                 let dist_client =
                     try_or_retry_later!(dist_client.context("failure during dist client creation"));
@@ -669,7 +804,29 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     };
     let dist_client = DistClientContainer::new(config, &pool);
 
-    let raw_storage = match storage_from_config(config, &pool) {
+    // Relayed cache reads ride the very transport compiler RPCs use: the one
+    // `Arc` created for this server and retained across client recreation.
+    // A managed cache that selected QUIC must never fall back to direct S3
+    // reads, so a missing transport fails startup instead of silently
+    // reverting to the un-relayed path.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    let relay_transport = dist_client.quic_transport();
+    #[cfg(not(all(feature = "s3", feature = "dist-client")))]
+    let relay_transport = None;
+    let relay_reader = match relay_reader_for(config, relay_transport) {
+        Ok(reader) => reader,
+        Err(error) => {
+            error!("relayed cache read configuration failed: {error:?}");
+            let notified = notify_server_startup(
+                notify.as_ref(),
+                ServerStartup::Err {
+                    reason: format!("{error:?}"),
+                },
+            );
+            return notified.and_then(|()| Err(error));
+        }
+    };
+    let raw_storage = match storage_from_config(config, &pool, relay_reader) {
         Ok(storage) => storage,
         Err(err) => {
             error!("storage init failed for: {err:?}");
@@ -1279,7 +1436,8 @@ where
                 toolchain_cache_size: 0,
                 toolchains: vec![],
                 rewrite_includes_only: false,
-                quic: false,
+                quic_enabled: false,
+                quic_transport: None,
             }),
             dist_client,
         )));
@@ -1378,6 +1536,12 @@ where
             let (ok, failed) = self.storage.billdfaster_touch_stats();
             stats.billdfaster_touches_ok = ok;
             stats.billdfaster_touches_failed = failed;
+            #[cfg(all(feature = "s3", feature = "dist-client"))]
+            {
+                let (hits, failures) = self.storage.billdfaster_relay_stats();
+                stats.billdfaster_relayed_reads_ok = hits;
+                stats.billdfaster_relayed_reads_failed = failures;
+            }
         }
         ServerInfo::new(stats, Some(&*self.storage)).await
     }
@@ -1395,6 +1559,12 @@ where
             let (ok, failed) = self.storage.billdfaster_touch_stats();
             s.billdfaster_touches_ok = ok;
             s.billdfaster_touches_failed = failed;
+            #[cfg(all(feature = "s3", feature = "dist-client"))]
+            {
+                let (hits, failures) = self.storage.billdfaster_relay_stats();
+                s.billdfaster_relayed_reads_ok = hits;
+                s.billdfaster_relayed_reads_failed = failures;
+            }
         }
         std::mem::take(&mut *s)
     }
@@ -2027,6 +2197,13 @@ pub struct ServerStats {
     pub billdfaster_touches_ok: u64,
     #[serde(default)]
     pub billdfaster_touches_failed: u64,
+    /// billdfaster relayed cache-read diagnostics: artifacts delivered by the
+    /// gateway and relayed reads that failed. A relayed miss is neither: it is
+    /// an ordinary cache miss. Failures never trigger a direct S3 read.
+    #[serde(default)]
+    pub billdfaster_relayed_reads_ok: u64,
+    #[serde(default)]
+    pub billdfaster_relayed_reads_failed: u64,
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -2059,6 +2236,8 @@ impl std::ops::AddAssign for ServerStats {
         self.dist_errors += rhs.dist_errors;
         self.billdfaster_touches_ok += rhs.billdfaster_touches_ok;
         self.billdfaster_touches_failed += rhs.billdfaster_touches_failed;
+        self.billdfaster_relayed_reads_ok += rhs.billdfaster_relayed_reads_ok;
+        self.billdfaster_relayed_reads_failed += rhs.billdfaster_relayed_reads_failed;
         self.multi_level = match (self.multi_level.take(), rhs.multi_level) {
             (Some(mut a), Some(b)) => {
                 a += b;
@@ -2120,6 +2299,8 @@ impl Default for ServerStats {
             multi_level: None,
             billdfaster_touches_ok: 0,
             billdfaster_touches_failed: 0,
+            billdfaster_relayed_reads_ok: 0,
+            billdfaster_relayed_reads_failed: 0,
         }
     }
 }
@@ -2266,6 +2447,18 @@ impl ServerStats {
             stats_vec,
             self.billdfaster_touches_failed,
             "Billdfaster metadata touch failures"
+        );
+        // billdfaster relayed cache reads. Misses are not counted here; a
+        // failure is a cache failure, never a direct S3 fallback.
+        set_stat!(
+            stats_vec,
+            self.billdfaster_relayed_reads_ok,
+            "Billdfaster relayed cache reads"
+        );
+        set_stat!(
+            stats_vec,
+            self.billdfaster_relayed_reads_failed,
+            "Billdfaster relayed cache read failures"
         );
 
         // Add multi-level cache statistics if available

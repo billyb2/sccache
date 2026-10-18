@@ -19,6 +19,7 @@ pub mod billdfaster_touch;
 #[allow(clippy::module_inception)]
 pub mod cache;
 pub mod cache_io;
+pub mod relay;
 #[cfg(feature = "cos")]
 pub mod cos;
 pub mod disk;

@@ -181,6 +181,16 @@ pub struct TouchClient {
 }
 
 impl TouchClient {
+    /// The configured namespace, shared with relayed cache reads.
+    pub fn namespace(&self) -> &str {
+        &self.config.namespace
+    }
+
+    /// The metadata bearer token, shared with relayed cache reads.
+    pub fn token(&self) -> &str {
+        &self.config.token
+    }
+
     pub fn new(config: TouchConfig) -> Self {
         // No per-request client-level timeout: the total touch deadline
         // is enforced against absolute wall time around the whole retry

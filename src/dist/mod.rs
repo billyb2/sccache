@@ -853,4 +853,14 @@ pub trait Client: Send + Sync {
     }
     fn rewrite_includes_only(&self) -> bool;
     fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
+    /// The shared QUIC transport selected for this client, if any.
+    ///
+    /// Billdfaster relayed result-cache reads reuse exactly this transport
+    /// (one endpoint, session store and connection) instead of opening their
+    /// own. The default implementation reports no QUIC transport, so every
+    /// non-QUIC client keeps its existing behavior.
+    #[cfg(all(feature = "s3", feature = "dist-client"))]
+    fn as_quic_transport(&self) -> Option<std::sync::Arc<crate::dist::quic::QuicClient>> {
+        None
+    }
 }
